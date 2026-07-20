@@ -1,0 +1,69 @@
+<div class="dashboard-wrapper">
+    <!-- En-tête -->
+    <DashboardHeader :username="currentUsername" @logout="handleLogout" @profile="goToProfile" />
+
+    <!-- Conteneur Principal avec largeur dynamique gauche/droite -->
+    <main class="dashboard-content" :style="contentGridStyle">
+      
+      <!-- Colonne de Gauche Rétractable -->
+      <section id="menu-gauche" :class="['scroll-container-left', { 'no-overflow-x': leftPanelState === 'normal' }]">
+        
+        <!-- Barre d'outils de dimensionnement du volet gauche -->
+        <div class="panel-resize-bar">
+          <div class="panel-controls-left">
+            <span class="panel-title-indicator">🛠️ Contrôle de l'affichage</span>
+            <div class="cycle-picker">
+              <label for="cycle-select">📅 Cycle</label>
+              <select id="cycle-select" v-model="selectedCycle" @change="onCycleChange" class="form-control" :disabled="isLoadingCycles">
+                <option value="">{{ isLoadingCycles ? 'Chargement...' : '-- Choisir Cycle --' }}</option>
+                <option v-for="cycle in cycles" :key="cycle.id" :value="cycle.value">{{ cycle.label }}</option>
+              </select>
+            </div>
+          </div>
+          <div class="btn-group-resize">
+            <button @click="setLeftPanelState('hidden')" :class="{ active: leftPanelState === 'hidden' }" title="Masquer le panneau">🔇 Masquer</button>
+            <button @click="setLeftPanelState('half')" :class="{ active: leftPanelState === 'half' }" title="Réduire de moitié">🔲 Moitié</button>
+            <button @click="setLeftPanelState('normal')" :class="{ active: leftPanelState === 'normal' }" title="Taille Normale">🔳 Normal</button>
+          </div>
+        </div>
+        <!-- LIGNE 1 : Filtres + Synthèse Cycle -->
+        <div class="row-dashboard-grid size-row-1">
+          <!--div class="col-sidebar-wide">
+            <StatChart :actionsData="mockChartQuantities" />
+          </div-->
+          <div class="col-fluid-table">
+            <SyntheseTable 
+              :selectedCycle="selectedCycle"
+              :daysInCycle="daysInSelectedCycle"
+              :treeData="syntheseTreeData"
+              :selectedDay="selectedDay"
+              :selectedCellsMap="selectedCellsMap"
+              @select-day="selectDay"
+              @cell-click="handleCellClick"
+            />
+            <div v-if="isLoadingSynthese" class="synthese-loading">Chargement de la synthèse…</div>
+            <div v-else-if="syntheseError" class="synthese-error">{{ syntheseError }}</div>
+          </div>
+        </div>
+
+
+        <div class="row-dashboard-grid size-row-1">
+          <div class="col-sidebar-wide">
+            <StatChart :actionsData="mockChartQuantities" />
+          </div>
+        </div>
+
+
+
+      </section>
+
+      <!-- Colonne de Droite : Cartographie Interactive active (Leaflet) -->
+      <section id="map-container">
+        <div id="map" ref="leafletMap"></div>
+        <div v-if="leftPanelState === 'hidden'" class="floating-restore-trigger">
+          <button @click="setLeftPanelState('normal')" class="btn-floating-restore" title="Restaurer le panneau gauche">➡️ Afficher les filtres</button>
+        </div>
+      </section>
+
+    </main>
+  </div>
