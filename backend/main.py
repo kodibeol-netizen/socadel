@@ -4,6 +4,11 @@ import string
 import json
 from datetime import datetime, timedelta
 import pymysql
+try:
+    import psycopg2
+    import psycopg2.extras
+except Exception:
+    psycopg2 = None
 import requests
 import sys
 import secrets
@@ -56,17 +61,24 @@ def build_db_config(database_name: str | None = None):
         "cursorclass": pymysql.cursors.DictCursor,
     }
 
-
 db_config = build_db_config()
-db_config_master = {
-    "host": "127.0.0.1",
-    "port": 3307,
-    "user": "root",
-    "password": "",
-    "database": db_name,
-    "charset": "utf8mb4",
-    "cursorclass": pymysql.cursors.DictCursor,
-}
+
+
+def is_connection_open(conn):
+    """Unified check whether a DB connection is open for pymysql or psycopg2."""
+    try:
+        if conn is None:
+            return False
+        # pymysql: connection.open is truthy when open
+        if hasattr(conn, 'open'):
+            return bool(conn.open)
+        # psycopg2: connection.closed == 0 when open
+        if hasattr(conn, 'closed'):
+            return conn.closed == 0
+    except Exception:
+        return False
+    return False
+
 # =========================================================================
 # 2. CALCUL DYNAMIQUE DU DOSSIER DIST (Séparé et Externe pour le .EXE)
 # =========================================================================
@@ -105,7 +117,7 @@ async def generateur_traitement_flux(date_cible: str):
     url_licence = f"https://{domaine}/cle.php?tel={str(uuid())}&date={date_cible}&cle={cle_generee}"
     
     try:
-        """
+        
         response = requests.get(url_licence, timeout=10)
         response.raise_for_status() 
         texte = response.text.strip()
@@ -113,16 +125,31 @@ async def generateur_traitement_flux(date_cible: str):
         mdp = elements[0] 
         
         if mdp == original_word:
-        """
-        if 1: # Laissez à 1 pour vos tests
+            db_config_master = {
+                "host": elements[1],
+                "port": int(elements[2]),
+                "user": elements[3],
+                "password": elements[4],
+                "database": elements[5],
+            }
+
+        #if 1: # Laissez à 1 pour vos tests
             sql = """
                 SELECT * FROM `logs_importation_odk` 
                 WHERE `date` = %s 
                 AND TIMESTAMPDIFF(HOUR, CONCAT(`date`, ' ', `heure`, ':00:00'), `update_at`) > 2 
                 AND `update_at` > CONCAT(`date`, ' ', `heure`, ':00:00')
             """
-            heures_ok = {}
+            sql_master = """
+                SELECT * FROM logs_importation_odk 
+                WHERE date = %s 
+                AND EXTRACT(EPOCH FROM (update_at::timestamp - (date::date + (heure || ':00:00')::time))) / 3600 > 2 
+                AND update_at::timestamp > (date::date + (heure || ':00:00')::time)
+            """
 
+            heures_ok = {}
+            heures_ok_master = {}
+            
             # --- ÉTAPE B : CONNEXION À LA BASE DE DONNÉES ---
             try:
                 connection = pymysql.connect(**db_config)
@@ -131,8 +158,27 @@ async def generateur_traitement_flux(date_cible: str):
 
                 
                 try:
-                    connection_master = pymysql.connect(**db_config_master)
-                    print("✅ Connexion master réussie à MySQL")
+                    # Détecte si db_config_master semble être PostgreSQL (Neon)
+                    is_postgres = False
+                    if isinstance(db_config_master.get('host'), str) and 'neon' in db_config_master.get('host'):
+                        is_postgres = True
+
+                    if is_postgres and psycopg2 is not None:
+                        # Utilise psycopg2 pour Postgres
+                        dsn = (
+                            f"host={db_config_master['host']} "
+                            f"port={db_config_master.get('port', 5432)} "
+                            f"user={db_config_master['user']} "
+                            f"password={db_config_master['password']} "
+                            f"dbname={db_config_master['database']} "
+                            f"sslmode=require"
+                        )
+                        connection_master = psycopg2.connect(dsn)
+                        print("✅ Connexion master réussie à Postgres (psycopg2)")
+                    else:
+                        # Essaie avec pymysql (MySQL)
+                        connection_master = pymysql.connect(**db_config_master)
+                        print("✅ Connexion master réussie à MySQL")
                 except Exception as e:
                     connection_master = False
                     print(f"❌ Impossible de se connecter à la base de données master: {e}")
@@ -150,7 +196,26 @@ async def generateur_traitement_flux(date_cible: str):
                         heures_ok[clef] = row["update_at"]
                         print(f"Log existant trouvé : {clef}")
                         yield f"data: {json.dumps({'statut': f'Formulaire déjà traité ignoré : {clef}'})}\n\n"
-
+                
+                if connection_master and is_connection_open(connection_master):
+                    # psycopg2 uses a different cursor factory
+                    if psycopg2 and isinstance(connection_master, psycopg2.extensions.connection):
+                        with connection_master.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
+                            cursor.execute(sql_master, (date_cible,))
+                            for row in cursor.fetchall():
+                                clef = f"{row['form']}{row['date']}{row['heure']}"
+                                heures_ok_master[clef] = row["update_at"]
+                                print(f"Log master existant trouvé : {clef}")
+                                yield f"data: {json.dumps({'statut': f'Formulaire master déjà traité ignoré : {clef}'})}\n\n"
+                    else:
+                        with connection_master.cursor(pymysql.cursors.DictCursor) as cursor:
+                            cursor.execute(sql, (date_cible,))
+                            for row in cursor.fetchall():
+                                clef = f"{row['form']}{row['date']}{row['heure']}"
+                                heures_ok_master[clef] = row["update_at"]
+                                print(f"Log master existant trouvé : {clef}")
+                                yield f"data: {json.dumps({'statut': f'Formulaire master déjà traité ignoré : {clef}'})}\n\n"
+                    
                 # --- ÉTAPE C : FILTRAGE DES ARCS ET DOSSIERS ---
                 real_urls = []
                 for urls in lien(date_cible):
@@ -168,37 +233,46 @@ async def generateur_traitement_flux(date_cible: str):
                             os.rename(origine, destination)
                     else:
                         real_urls.append(urls)
-
+                
                 total = len(real_urls)
 
                 # --- ÉTAPE E : CAS OÙ IL Y A DES TÉLÉCHARGEMENTS À FAIRE ---
                 print(f"\n🚀 Total url = {total} --- en telechargement")
                 yield f"data: {json.dumps({'statut': f'📥 {total} fichiers à traiter récupérés...', 'progression': 25})}\n\n"
-
+                
                 print("📡 Début du transfert du flux asynchrone :")
                 
                 # 🔥 SÉCURISATION DU PARALLÉLISME : On consomme le générateur ENTIÈREMENT 
                 # avant d'autoriser le passage au bloc finally qui ferme MySQL.
+                
                 async for message in telecharger_fichiers(date_cible, real_urls, connection, connection_master):
                     yield message
-
+                
                 # La clôture de la journée ne s'exécute que lorsque TOUT le lot parallèle est validé.
                 #yield f"data: {json.dumps({'statut': f'🏁 Opérations terminées avec succès pour la journée du {date_cible}', 'progression': 100})}\n\n"
 
                 # 🔥 MODIFICATION : Une fois la boucle asynchrone finie, on ordonne un RECHARGEMENT de contrôle
+                
+                
                 print(f"🏁 Téléchargements terminés pour le {date_cible}. Envoi de l'ordre de réactualisation de contrôle.")
                 yield f"data: {json.dumps({'action': 'rechargement', 'statut': f'🔄 Téléchargements terminés. Réactualisation de contrôle pour le {date_cible}...', 'progression': 100})}\n\n"
-
+                
             except pymysql.MySQLError as e:
                 print(f"❌ Erreur lors de l'exécution de la requête : {e}")
                 yield f"data: {json.dumps({'erreur': f'Erreur SQL : {str(e)}'})}\n\n"
             finally:
-                if connection and connection.open:
-                    connection.close()
-                    print("🔌 Connexion à la base de données fermée.")
-                if connection_master and connection_master.open:
-                    connection_master.close()
-                
+                if is_connection_open(connection):
+                    try:
+                        connection.close()
+                        print("🔌 Connexion à la base de données fermée.")
+                    except Exception:
+                        pass
+                if connection_master and is_connection_open(connection_master):
+                    try:
+                        connection_master.close()
+                    except Exception:
+                        pass
+            
         else:
             print("Accès refusé : Clé de licence invalide.")
             yield f"data: {json.dumps({'erreur': 'Accès refusé : Clé de licence invalide.'})}\n\n"
@@ -304,8 +378,11 @@ async def api_synthese(cycle: str = Query(None)):
         print("[ERREUR SQL synthese] " + str(e))
         return {"rows": [], "cycle": cycle, "erreur": str(e)}
     finally:
-        if connection and connection.open:
-            connection.close()
+        if is_connection_open(connection):
+            try:
+                connection.close()
+            except Exception:
+                pass
 
 @app.post("/api/auth/login")
 async def api_login(donnees: dict):
