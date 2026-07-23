@@ -1,11 +1,17 @@
 import os
 import re
+import sys
 import httpx
 import urllib.parse
 import zipfile
 import re
 import csv
 import pymysql
+try:
+    import psycopg2
+    import psycopg2.extras
+except Exception:
+    psycopg2 = None
 import platform
 import subprocess
 from datetime import datetime, timedelta
@@ -48,6 +54,19 @@ def uuid():
 
     # --- AUTRES SYSTÈMES ---
     return "pas de chemin"
+
+def is_connection_open(conn):
+    """Unified check whether a DB connection is open for pymysql or psycopg2."""
+    try:
+        if conn is None:
+            return False
+        if hasattr(conn, 'open'):
+            return bool(conn.open)
+        if hasattr(conn, 'closed'):
+            return conn.closed == 0
+    except Exception:
+        return False
+    return False
 
 def charger(result: list, date: str, heure: str, form: str, connection, connection_master):
     """
@@ -133,10 +152,18 @@ def charger(result: list, date: str, heure: str, form: str, connection, connecti
                     coordonnee_Altitude = VALUES(coordonnee_Altitude),
                     coordonnee_Accuracy = VALUES(coordonnee_Accuracy);
             """
-
+            sql_csv_master = f"""
+                INSERT INTO tmp_chargement_odk ({", ".join(colonnes_csv)})
+                VALUES ({string_placeholders_master})
+                ON CONFLICT (id) 
+                DO UPDATE SET 
+                    action = EXCLUDED.action, pl_serial_number = EXCLUDED.pl_serial_number,
+                    coordonnee_Latitude = EXCLUDED.coordonnee_Latitude, coordonnee_Longitude = EXCLUDED.coordonnee_Longitude,
+                    coordonnee_Altitude = EXCLUDED.coordonnee_Altitude, coordonnee_Accuracy = EXCLUDED.coordonnee_Accuracy;
+            """
 
             # 4. Exécution optimisée par VRAIS LOTS de 1 000
-            if connection and connection.open:
+            if is_connection_open(connection):
                 with connection.cursor() as cursor_csv:
                     for i in range(0, len(tuples_csv), 1000):
                         lot_actuel = tuples_csv[i:i + 1000]
@@ -158,8 +185,28 @@ def charger(result: list, date: str, heure: str, form: str, connection, connecti
                 print("💾 [SUCCESS] Toutes les données CSV locales ont été validées sur le disque.")
 
             # Même logique pour la connexion MASTER (si applicable dans votre architecture)
-            if connection_master and connection_master.open:
-                with connection_master.cursor() as cursor_csv_master:
+            if connection_master and is_connection_open(connection_master):
+                # Support psycopg2 connection cursors as well
+                if psycopg2 and isinstance(connection_master, psycopg2.extensions.connection):
+                    with connection_master.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor_csv_master:
+                        for i in range(0, len(tuples_csv), 1000):
+                            lot_actuel = tuples_csv[i:i + 1000]
+                            try:
+                                cursor_csv_master.executemany(sql_csv_master, lot_actuel)
+                            except Exception as e:
+                                connection_master.rollback()
+                                print(f"❌ Erreur MASTER Postgres lors du lot CSV : {e}")
+                                raise e
+                else:
+                    with connection_master.cursor() as cursor_csv_master:
+                        for i in range(0, len(tuples_csv), 1000):
+                            lot_actuel = tuples_csv[i:i + 1000]
+                            try:
+                                cursor_csv_master.executemany(sql_csv_master, lot_actuel)
+                            except pymysql.MySQLError as e:
+                                connection_master.rollback()
+                                print(f"❌ Erreur MySQL MASTER lors du lot CSV : {e}")
+                                raise e
                     for i in range(0, len(tuples_csv), 1000):
                         lot_actuel = tuples_csv[i:i + 1000]
                         try:
@@ -175,8 +222,29 @@ def charger(result: list, date: str, heure: str, form: str, connection, connecti
             # -----------------------------------------------------------------
             # FIN DE LA SECTION 1 (CSV MASTER) : Exécution optimisée par VRAIS LOTS
             # -----------------------------------------------------------------
-            if connection_master and connection_master.open:
-                with connection_master.cursor() as cursor_csv_master:
+            if connection_master and is_connection_open(connection_master):
+                if psycopg2 and isinstance(connection_master, psycopg2.extensions.connection):
+                    with connection_master.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor_csv_master:
+                        for i in range(0, len(tuples_csv), 1000):
+                            lot_actuel = tuples_csv[i:i + 1000]
+                            try:
+                                lignes_aff_master = cursor_csv_master.executemany(sql_csv_master, lot_actuel)
+                                print(f"⚡ [CSV MASTER] Lot {i // 1000 + 1} envoyé en mémoire ({len(lot_actuel)} lignes). Affectées : {lignes_aff_master}")
+                            except Exception as e:
+                                connection_master.rollback()
+                                print(f"❌ Erreur MASTER lors du lot CSV {i // 1000 + 1} : {e}")
+                                raise e
+                else:
+                    with connection_master.cursor() as cursor_csv_master:
+                        for i in range(0, len(tuples_csv), 1000):
+                            lot_actuel = tuples_csv[i:i + 1000]
+                            try:
+                                lignes_aff_master = cursor_csv_master.executemany(sql_csv_master, lot_actuel)
+                                print(f"⚡ [CSV MASTER] Lot {i // 1000 + 1} envoyé en mémoire ({len(lot_actuel)} lignes). Affectées : {lignes_aff_master}")
+                            except pymysql.MySQLError as e:
+                                connection_master.rollback()
+                                print(f"❌ Erreur MySQL MASTER lors du lot CSV {i // 1000 + 1} : {e}")
+                                raise e
                     for i in range(0, len(tuples_csv), 1000):
                         lot_actuel = tuples_csv[i:i + 1000]
                         try:
@@ -205,7 +273,10 @@ def charger(result: list, date: str, heure: str, form: str, connection, connecti
                 VALUES (%s, %s, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE nom = VALUES(nom);
             """
-
+            sql_image = """
+                INSERT INTO image (form, date, heure, nom, taille) VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (nom) DO UPDATE SET nom = EXCLUDED.nom;
+            """
                
             # Transformation en liste de tuples ordonnés pour le moteur MySQL
             tuples_jpg = [
@@ -213,8 +284,33 @@ def charger(result: list, date: str, heure: str, form: str, connection, connecti
                 for r in result_jpg
             ]
             
-            if connection_master and connection_master.open:
-                with connection_master.cursor() as cursor_master:
+            if connection_master and is_connection_open(connection_master):
+                if psycopg2 and isinstance(connection_master, psycopg2.extensions.connection):
+                    with connection_master.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor_master:
+                        try:
+                            for i in range(0, len(tuples_jpg), 1000):
+                                lot_actuel = tuples_jpg[i:i + 1000]
+                                lignes_affectees = cursor_master.executemany(sql_image, lot_actuel)
+                                print(f"⚡ [IMAGES MASTER] Morceau {i // 1000 + 1} envoyé en mémoire ({len(lot_actuel)} images).")
+                            connection_master.commit()
+                            print(f"💾 [SUCCESS] Les {len(tuples_jpg)} images ont été écrites physiquement sur le disque Master.")
+                        except Exception as error_img:
+                            connection_master.rollback()
+                            print(f"❌ Erreur MASTER spécifique aux images (Transaction annulée) : {error_img}")
+                            raise error_img
+                else:
+                    with connection_master.cursor() as cursor_master:
+                        try:
+                            for i in range(0, len(tuples_jpg), 1000):
+                                lot_actuel = tuples_jpg[i:i + 1000]
+                                lignes_affectees = cursor_master.executemany(sql_image, lot_actuel)
+                                print(f"⚡ [IMAGES MASTER] Morceau {i // 1000 + 1} envoyé en mémoire ({len(lot_actuel)} images).")
+                            connection_master.commit()
+                            print(f"💾 [SUCCESS] Les {len(tuples_jpg)} images ont été écrites physiquement sur le disque Master.")
+                        except pymysql.MySQLError as error_img:
+                            connection_master.rollback()
+                            print(f"❌ Erreur MySQL spécifique aux images (Transaction annulée) : {error_img}")
+                            raise error_img
                     try:
                         for i in range(0, len(tuples_jpg), 1000):
                             lot_actuel = tuples_jpg[i:i + 1000]
@@ -229,7 +325,91 @@ def charger(result: list, date: str, heure: str, form: str, connection, connecti
                         connection_master.rollback()
                         print(f"❌ Erreur MySQL spécifique aux images (Transaction annulée) : {error_img}")
                         raise error_img
-                
+
+
+
+        sql_agence_lies = """
+            UPDATE tmp_chargement_odk
+            SET agence_liee = COALESCE(rech.agences_liees, 'non identifie')
+            FROM (
+                SELECT 
+                    t.cle, 
+                    string_agg(bc.agency, ';') AS agences_liees
+                FROM tmp_chargement_odk AS t
+                JOIN limites_agences AS bc 
+                ON ST_Contains(
+                    bc.boundary, 
+                    ST_GeomFromText('POINT(' || t.coordonnee_Longitude || ' ' || t.coordonnee_Latitude || ')', 4326)
+                    )
+                WHERE t.coordonnee_Longitude IS NOT NULL AND t.coordonnee_Latitude IS NOT NULL
+                GROUP BY t.cle
+            ) AS rech
+            WHERE tmp_chargement_odk.cle = rech.cle
+            AND (tmp_chargement_odk.agence_liee IS NULL OR tmp_chargement_odk.agence_liee = '');
+        """  
+        sql_bloc = """
+            UPDATE tmp_chargement_odk
+            SET 
+                bloc = COALESCE(bc.block_code, 'bloc non identifie'),
+                agence_liee = COALESCE(bc.agence, 'agence non identifie')
+            FROM bloc AS bc
+            WHERE ST_Contains(
+                    bc.boundary, 
+                    ST_GeomFromText('POINT(' || tmp_chargement_odk.coordonnee_Longitude || ' ' || tmp_chargement_odk.coordonnee_Latitude || ')', 4326)
+                ) 
+            AND bc.agency = ANY(string_to_array(tmp_chargement_odk.agence_liee, ';'))
+            AND (tmp_chargement_odk.bloc IS NULL OR tmp_chargement_odk.bloc = '')
+            AND tmp_chargement_odk.coordonnee_Longitude IS NOT NULL 
+            AND tmp_chargement_odk.coordonnee_Latitude IS NOT NULL;
+        """   
+        sql_mra = """
+            UPDATE tmp_chargement_odk AS target
+            SET 
+                mra_contrat  = COALESCE(sub.mra_contrat, 'non identifie'),
+                mra_compteur = COALESCE(sub.mra_compteur, 'non identifie'),
+                mra_pl       = COALESCE(sub.mra_pl, 'non identifie')
+            FROM (
+                SELECT 
+                    t.cle,
+                    mra.contrat AS mra_contrat,
+                    mra.compteur AS mra_compteur,
+                    mra.pl AS mra_pl
+                FROM tmp_chargement_odk AS t
+                JOIN bloc AS bc ON t.bloc = bc.block_code
+                JOIN mra AS mra ON (
+                    bc.SALESPOINT = mra.code_agence 
+                    AND (
+                        mra.compteur = ANY(string_to_array(t.pl_code_bare, ','))
+                        OR mra.compteur = ANY(string_to_array(t.pl_serial_number, ','))
+                        OR mra.contrat = ANY(string_to_array(t.contrat, ','))
+                    )
+                )
+                WHERE (t.ref_formulaire = 'DRC' OR t.ref_formulaire = 'DCUY') 
+                AND (t.mra_contrat IS NULL OR t.mra_contrat = '')
+                ORDER BY t.cle ASC
+                LIMIT 10000
+            ) AS sub
+            WHERE target.cle = sub.cle;
+        """
+
+        sql_copier_tmp = """
+            INSERT INTO chargement_odk
+            SELECT t.*
+            FROM tmp_chargement_odk AS t
+            JOIN logs_importation_odk AS l 
+            ON t.form = l.form
+            AND t.date_filtre_telechargement = l.date
+            AND t.heure_date_filtre_telechargement = l.heure
+            WHERE LENGTH(t.bloc) > 0
+            ON CONFLICT (id) 
+            DO UPDATE SET form = EXCLUDED.form;
+        """
+        sql_vider_tmp = """
+            DELETE FROM tmp_chargement_odk AS t
+            USING chargement_odk AS l
+            WHERE t.cle = l.cle
+            AND LENGTH(t.bloc) > 0;
+        """
         # =====================================================================
         # SECTION 3 : LOGS D'IMPORTATION
         # =====================================================================
@@ -244,7 +424,19 @@ def charger(result: list, date: str, heure: str, form: str, connection, connecti
                     qte_csv = VALUES(qte_csv),
                     qte_image = VALUES(qte_image);
             """
-
+            sql_logs_master = """
+                INSERT INTO logs_importation_odk (form, date, heure, qte_csv, qte_image) VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (form, date, heure) DO UPDATE SET qte_csv = EXCLUDED.qte_csv, qte_image = EXCLUDED.qte_image;
+            """
+            sql_logs_master = """
+                INSERT INTO logs_importation_odk (form, date, heure, qte_csv, qte_image, update_at) 
+                VALUES (%s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (form, date, heure) 
+                DO UPDATE SET 
+                    qte_csv = EXCLUDED.qte_csv,
+                    qte_image = EXCLUDED.qte_image,
+                    update_at = NOW();
+            """
             sql_logs = """
                 INSERT INTO logs_importation_odk (form, date, heure) 
                 VALUES (%s, %s, %s)
@@ -254,25 +446,41 @@ def charger(result: list, date: str, heure: str, form: str, connection, connecti
 
             
             # Écriture du log en local
-            if connection and connection.open:
+            if is_connection_open(connection):
                 with connection.cursor() as cursor_log:
                     cursor_log.execute(sql_logs, [form, date, heure])
                 connection.commit()
                 
             # Écriture du log sur le Master
-            if connection_master and connection_master.open:
-                with connection_master.cursor() as cursor_log_master:
-                    cursor_log_master.execute(sql_logs_master, [form, date, heure, result[3], result[4]])
-                connection_master.commit()
+            if connection_master and is_connection_open(connection_master):
+                if psycopg2 and isinstance(connection_master, psycopg2.extensions.connection):
+                    with connection_master.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor_log_master:
+                        cursor_log_master.execute(sql_agence_lies)
+                        cursor_log_master.execute(sql_bloc)
+                        cursor_log_master.execute(sql_mra)
+                        cursor_log_master.execute(sql_copier_tmp)
+                        cursor_log_master.execute(sql_vider_tmp)
+                        cursor_log_master.execute(sql_logs_master, [form, date, heure, result[3], result[4]])
+                    connection_master.commit()
+                else:
+                    with connection_master.cursor() as cursor_log_master:
+                        cursor_log_master.execute(sql_logs_master, [form, date, heure, result[3], result[4]])
+                    connection_master.commit()
                 
             print(f"✅ Logs enregistrés. Données importées avec succès : {len(result_jpg)} images et {len(result_csv)} lignes CSV.")
             
     except pymysql.MySQLError as e:
         # Sécurité globale si une erreur non gérée survient en amont
-        if connection and connection.open:
-            connection.rollback()
-        if connection_master and connection_master.open:
-            connection_master.rollback()
+        if is_connection_open(connection):
+            try:
+                connection.rollback()
+            except Exception:
+                pass
+        if connection_master and is_connection_open(connection_master):
+            try:
+                connection_master.rollback()
+            except Exception:
+                pass
         print(f"❌ Erreur critique globale MySQL, transactions annulées : {e}")
     finally:
         # Les contextes 'with' gèrent la fermeture des curseurs automatiquement.
@@ -1144,14 +1352,15 @@ async def telecharger_un_fichier(client: httpx.AsyncClient, url_info: dict, date
     os.makedirs(dossier, exist_ok=True)
     
     chemin_complet_zip = f"{dossier}/{url_info['form']} {url_info['heure']}h.zip"
-  
-    try:
+    try: 
         if os.path.exists(chemin_complet_zip):
+            print("ok " + chemin_complet_zip)
             tester = extraire(date_str, url_info)
             if "Test Dézippé OK" in tester:
                 return {"statut": "ok", "chemin": chemin_complet_zip, "info": url_info}
-
+        
         async with client.stream("GET", url_info["url"], headers=headers, timeout=600.0) as reponse:
+            #return {"statut": "ok", "chemin": chemin_complet_zip, "info": url_info}
             if reponse.status_code == 200:
                 # 📊 RÉCUPÉRATION DE LA TAILLE TOTALE DU FICHIER
                 taille_totale = int(reponse.headers.get("Content-Length", 0))
@@ -1182,10 +1391,10 @@ async def telecharger_un_fichier(client: httpx.AsyncClient, url_info: dict, date
                 return {"statut": "ok", "chemin": chemin_complet_zip, "info": url_info}
             else:
                 return {"statut": "erreur", "message": f"Code HTTP {reponse.status_code}", "info": url_info}
-            
+          
     except Exception as e:
         return {"statut": "erreur", "message": str(e), "info": url_info}
-
+    
 async def telecharger_fichiers(date_str: str, real_urls: list, connexion_bdd, connexion_bdd_master):
     """
     Télécharge et traite les fichiers en PARALLÈLE par lots de 5.
@@ -1210,18 +1419,19 @@ async def telecharger_fichiers(date_str: str, real_urls: list, connexion_bdd, co
         
     print(f"🚀 Lancement du téléchargement parallèle de {total} fichiers (Lots de 5)...")
     
-    token = await obtenir_token_odk()    
+    token = "" #await obtenir_token_odk()    
     headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",
         "Authorization": f"Bearer {token}" if token else ""
     }
-
+    
     semaphore = asyncio.Semaphore(5)
     queue_messages = asyncio.Queue()
 
     # --- SOUS-FONCTION DE SÉCURITÉ POUR CHAQUE FICHIER ---
     async def gerer_un_telechargement_et_traitement(index, url_info, client):
+        
         async with semaphore:
             progression_base = int((index / total) * 50) + 45
             queue_taille = asyncio.Queue()
@@ -1264,7 +1474,7 @@ async def telecharger_fichiers(date_str: str, real_urls: list, connexion_bdd, co
                         'statut': f"⚠️ Échec vérification archive : {url_info['form']} ({url_info['heure']}h)",
                         'progression': progression_base
                     })
-
+            
     # 🔥 CORRECTIF TYPING PYTHON 3.14 : Encapsulation dans une coroutine propre
     async def executer_groupe_parallele():
         async with httpx.AsyncClient(verify=False) as client:
@@ -1274,7 +1484,7 @@ async def telecharger_fichiers(date_str: str, real_urls: list, connexion_bdd, co
             ]
             # gather est attendu directement avec 'await', sans create_task autour
             await asyncio.gather(*taches)
-
+    
     # Lancement de la coroutine globale
     execution_globale = asyncio.create_task(executer_groupe_parallele())
     
@@ -1287,6 +1497,7 @@ async def telecharger_fichiers(date_str: str, real_urls: list, connexion_bdd, co
             pass
             
     await execution_globale
+    
 
 
 
@@ -1307,5 +1518,5 @@ async def lancer_le_test():
 
 # 3. Point d'entrée obligatoire pour démarrer le moteur asynchrone de Python
 if __name__ == "__main__":
-    print(testuuid)
+    print(uuid)
     asyncio.run(lancer_le_test())
