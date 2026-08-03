@@ -52,6 +52,8 @@ db_name = os.getenv("DB_DATABASE", "client")
 
 
 def build_db_config(database_name: str | None = None):
+    print("serveur mysql " + serveur_actuel)
+    print("serveur database " + db_name )
     return {
         "host": serveur_actuel,
         "port": int(os.getenv("DB_PORT", 3306)),
