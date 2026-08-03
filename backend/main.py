@@ -689,9 +689,9 @@ def obtenir_limites_agences():
     Récupère la liste des régions et agences depuis la table `limites_agences`
     """
     connection = None
-    print("dans limit 1")
     try:
         connection = pymysql.connect(**build_db_config())
+        print("dans limit param" + build_db_config())
         with connection.cursor(pymysql.cursors.DictCursor) as cursor:
             sql = "SELECT DISTINCT region, agency FROM limites_agences"
             print("dans limit 1" + sql)
