@@ -784,17 +784,31 @@ def obtenir_chargement_odk(cycle: str = Query(None), collecteur: str = None):
                         `coordonnee_Longitude` AS lng,
                         `pl_type_compteur` AS type_compteur,
                         CASE 
-                            WHEN LENGTH(mra_contrat) > 6 AND ST_Distance_Sphere(ST_SRID(mra_point, 4326), ST_SRID(point, 4326)) < 500 THEN 'identifie proche'
-                            WHEN LENGTH(mra_contrat) > 6 AND ST_Distance_Sphere(ST_SRID(mra_point, 4326), ST_SRID(point, 4326)) >= 500 THEN 'identifie non proche'
+                            WHEN LENGTH(mra_contrat) > 6 
+                                AND mra_point IS NOT NULL 
+                                AND point IS NOT NULL 
+                                AND ST_Distance_Sphere(mra_point, point) < 500 
+                            THEN 'identifie proche'
+
+                            WHEN LENGTH(mra_contrat) > 6 
+                                AND mra_point IS NOT NULL 
+                                AND point IS NOT NULL 
+                                AND ST_Distance_Sphere(mra_point, point) >= 500 
+                            THEN 'identifie non proche'
+
                             ELSE 'non identifie'
                         END AS repartition
                     FROM `chargement_odk` 
                     WHERE SUBSTRING(`date_filtre_telechargement`, 1, 7) = '{cycle}'  AND `collecteur` = '{collecteur}'
                 """
-            print(sql)
+                #CASE 
+                #        WHEN LENGTH(mra_contrat) > 6 AND ST_Distance_Sphere(ST_SRID(mra_point, 4326), ST_SRID(point, 4326)) < 500 THEN 'identifie proche'
+                #        WHEN LENGTH(mra_contrat) > 6 AND ST_Distance_Sphere(ST_SRID(mra_point, 4326), ST_SRID(point, 4326)) >= 500 THEN 'identifie non proche'
+                #        ELSE 'non identifie'
+                #    END AS repartition
+                
             cursor.execute(sql)
             resultats = cursor.fetchall()
-            print(resultats)
             # Ajouter un ID virtuel pour Vue.js
             for idx, item in enumerate(resultats):
                 item['id'] = idx + 1
