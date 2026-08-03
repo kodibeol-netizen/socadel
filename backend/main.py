@@ -784,8 +784,8 @@ def obtenir_chargement_odk(cycle: str = Query(None), collecteur: str = None):
                         `coordonnee_Longitude` AS lng,
                         `pl_type_compteur` AS type_compteur,
                         CASE 
-                            WHEN LENGTH(mra_contrat) > 6 AND ST_Distance_Sphere(mra_point, point) < 500 THEN 'identifie proche'
-                            WHEN LENGTH(mra_contrat) > 6 AND ST_Distance_Sphere(mra_point, point) >= 500 THEN 'identifie non proche'
+                            WHEN LENGTH(mra_contrat) > 6 AND ST_Distance_Sphere(ST_SRID(mra_point, 4326), ST_SRID(point, 4326)) < 500 THEN 'identifie proche'
+                            WHEN LENGTH(mra_contrat) > 6 AND ST_Distance_Sphere(ST_SRID(mra_point, 4326), ST_SRID(point, 4326)) >= 500 THEN 'identifie non proche'
                             ELSE 'non identifie'
                         END AS repartition
                     FROM `chargement_odk` 
