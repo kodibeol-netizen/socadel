@@ -690,14 +690,11 @@ def obtenir_limites_agences():
     """
     connection = None
     try:
-        print("dans limit param" + build_db_config())
         connection = pymysql.connect(**build_db_config())
         with connection.cursor(pymysql.cursors.DictCursor) as cursor:
             sql = "SELECT DISTINCT region, agency FROM limites_agences"
-            print("dans limit 1" + sql)
             cursor.execute(sql)
             resultats = cursor.fetchall()
-            print("dans limit 1" + resultats)
         connection.close()
         return resultats
     except Exception as e:
