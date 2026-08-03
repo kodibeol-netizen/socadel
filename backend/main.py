@@ -791,10 +791,10 @@ def obtenir_chargement_odk(cycle: str = Query(None), collecteur: str = None):
                     FROM `chargement_odk` 
                     WHERE SUBSTRING(`date_filtre_telechargement`, 1, 7) = '{cycle}'  AND `collecteur` = '{collecteur}'
                 """
-            #print(sql)
+            print(sql)
             cursor.execute(sql)
             resultats = cursor.fetchall()
-            
+            print(resultats)
             # Ajouter un ID virtuel pour Vue.js
             for idx, item in enumerate(resultats):
                 item['id'] = idx + 1
