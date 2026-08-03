@@ -85,7 +85,7 @@ def is_connection_open(conn):
         return False
     return False
 
-def charger(result: list, date: str, heure: str, form: str, connection, connection_master):
+def charger_save(result: list, date: str, heure: str, form: str, connection, connection_master):
     """
     Insère en masse (Bulk Insert) les données CSV, images et logs dans la base MySQL.
     Gère la mise à jour des doublons via ON DUPLICATE KEY UPDATE (Syntaxe optimisée MySQL 8.0+).
@@ -379,6 +379,26 @@ def charger(result: list, date: str, heure: str, form: str, connection, connecti
             AND tmp_chargement_odk.coordonnee_Longitude IS NOT NULL 
             AND tmp_chargement_odk.coordonnee_Latitude IS NOT NULL;
         """   
+        sql_bloc = """
+            UPDATE tmp_chargement_odk AS t
+            JOIN bloc AS bc ON ST_Contains(
+                bc.boundary, 
+                ST_GeomFromText(CONCAT('POINT(', t.coordonnee_Longitude, ' ', t.coordonnee_Latitude, ')'), 4326)
+            )
+            -- FIND_IN_SET nécessite des virgules, on remplace donc les ';' par des ','
+            SET 
+                t.bloc = COALESCE(bc.block_code, 'bloc non identifie'),
+                t.agence_liee = COALESCE(bc.agence, 'agence non identifie')
+            WHERE FIND_IN_SET(bc.agency, REPLACE(t.agence_liee, ';', ',')) > 0
+            AND (t.bloc IS NULL OR t.bloc = '')
+            AND t.coordonnee_Longitude IS NOT NULL 
+            AND t.coordonnee_Latitude IS NOT NULL;
+        """
+        sql_bloc_unic = """
+            UPDATE tmp_chargement_odk AS c
+            LEFT JOIN bloc AS b ON c.bloc = b.block_code
+            SET c.agence_liee = COALESCE(b.AGENCE, 'non trouve');
+        """
         sql_mra = """
             UPDATE tmp_chargement_odk AS target
             SET 
@@ -408,6 +428,23 @@ def charger(result: list, date: str, heure: str, form: str, connection, connecti
             ) AS sub
             WHERE target.cle = sub.cle;
         """
+        sql_mra = """
+            UPDATE tmp_chargement_odk AS target
+            JOIN bloc AS bc ON target.bloc = bc.block_code
+            JOIN mra AS mra ON bc.SALESPOINT = mra.code_agence 
+                AND (
+                    FIND_IN_SET(mra.compteur, target.pl_code_bare) > 0
+                    OR FIND_IN_SET(mra.compteur, target.pl_serial_number) > 0
+                    OR FIND_IN_SET(mra.contrat, target.contrat) > 0
+                )
+            SET 
+                target.mra_contrat  = COALESCE(mra.contrat, 'non identifie'),
+                target.mra_compteur = COALESCE(mra.compteur, 'non identifie'),
+                target.mra_pl       = COALESCE(mra.pl, 'non identifie')
+            WHERE (target.ref_formulaire = 'DRC' OR target.ref_formulaire = 'DCUY') 
+            AND (target.mra_contrat IS NULL OR target.mra_contrat = '');
+
+        """
 
         sql_copier_tmp = """
             INSERT INTO chargement_odk
@@ -426,6 +463,128 @@ def charger(result: list, date: str, heure: str, form: str, connection, connecti
             USING chargement_odk AS l
             WHERE t.cle = l.cle
             AND LENGTH(t.bloc) > 0;
+        """
+        sql_synthese_odk = """
+            INSERT INTO synthese_mensuel_odk (
+                periode, ref_formulaire, agence, bloc, total, last_realisation, last_submit,
+                CUMUL_DEPANNAGE, CUMUL_DETECTION, CUMUL_DISTRIBUTION, CUMUL_INSPECTION, 
+                CUMUL_NEW_METER, CUMUL_NORMALISATION, CUMUL_RECOUVREMENT, CUMUL_RELEVE, CUMUL_BRANCHEMENT,
+
+                CUMUL_MOIN_500_DEPANNAGE, CUMUL_PLUS_500_DEPANNAGE, CUMUL_NON_IDENTIFIE_DEPANNAGE, 
+                CUMUL_MOIN_500_DETECTION, CUMUL_PLUS_500_DETECTION, CUMUL_NON_IDENTIFIE_DETECTION, 
+                CUMUL_MOIN_500_DISTRIBUTION, CUMUL_PLUS_500_DISTRIBUTION, CUMUL_NON_IDENTIFIE_DISTRIBUTION, 
+                CUMUL_MOIN_500_INSPECTION, CUMUL_PLUS_500_INSPECTION, CUMUL_NON_IDENTIFIE_INSPECTION, 
+                CUMUL_MOIN_500_NEW_METER, CUMUL_PLUS_500_NEW_METER, CUMUL_NON_IDENTIFIE_NEW_METER, 
+                CUMUL_MOIN_500_NORMALISATION, CUMUL_PLUS_500_NORMALISATION, CUMUL_NON_IDENTIFIE_NORMALISATION, 
+                CUMUL_MOIN_500_RECOUVREMENT, CUMUL_PLUS_500_RECOUVREMENT, CUMUL_NON_IDENTIFIE_RECOUVREMENT, 
+                CUMUL_MOIN_500_RELEVE, CUMUL_PLUS_500_RELEVE, CUMUL_NON_IDENTIFIE_RELEVE, 
+                CUMUL_MOIN_500_BRANCHEMENT, CUMUL_PLUS_500_BRANCHEMENT, CUMUL_NON_IDENTIFIE_BRANCHEMENT,
+                
+                J1, J2, J3, J4, J5, J6, J7, J8, J9, J10, J11, J12, J13, J14, J15, J16, J17, J18, J19, J20, 
+                J21, J22, J23, J24, J25, J26, J27, J28, J29, J30, J31
+            )
+            SELECT 
+                SUBSTRING(`date_filtre_telechargement`, 1, 7) AS periode, 
+                `ref_formulaire`, 
+                `agence_liee` AS agence, 
+                'bloc' AS bloc,
+                COUNT(*) AS total,
+                MAX(`SubmissionDate`) AS last_realisation,
+                MAX(CONCAT(`date_filtre_telechargement`, ' ', `heure_date_filtre_telechargement`, ':00:00')) AS last_submit,
+                
+                COUNT(CASE WHEN action = 'DEPANNAGE' THEN 1 END) AS CUMUL_DEPANNAGE,
+                COUNT(CASE WHEN action = 'DETECTION' THEN 1 END) AS CUMUL_DETECTION,
+                COUNT(CASE WHEN action = 'DISTRIBUTION' THEN 1 END) AS CUMUL_DISTRIBUTION,
+                COUNT(CASE WHEN action = 'INSPECTION' THEN 1 END) AS CUMUL_INSPECTION,
+                COUNT(CASE WHEN action = 'NEW METER' THEN 1 END) AS CUMUL_NEW_METER,
+                COUNT(CASE WHEN action = 'NORMALISATION' THEN 1 END) AS CUMUL_NORMALISATION,
+                COUNT(CASE WHEN action = 'RECOUVREMENT' THEN 1 END) AS CUMUL_RECOUVREMENT,
+                COUNT(CASE WHEN action = 'RELEVE' THEN 1 END) AS CUMUL_RELEVE,
+                COUNT(CASE WHEN action = 'BRANCHEMENT' THEN 1 END) AS CUMUL_BRANCHEMENT,
+
+                COUNT(CASE WHEN LENGTH(mra_contrat) > 6 AND ST_Distance_Sphere(mra_point, point) < 500 AND action = 'DEPANNAGE' THEN 1 END) AS CUMUL_MOIN_500_DEPANNAGE,
+                COUNT(CASE WHEN LENGTH(mra_contrat) > 6 AND ST_Distance_Sphere(mra_point, point) >= 500 AND action = 'DEPANNAGE' THEN 1 END) AS CUMUL_PLUS_500_DEPANNAGE,
+                COUNT(CASE WHEN LENGTH(mra_contrat) <= 6 AND action = 'DEPANNAGE' THEN 1 END) AS CUMUL_NON_IDENTIFIE_DEPANNAGE,
+
+                COUNT(CASE WHEN LENGTH(mra_contrat) > 6 AND ST_Distance_Sphere(mra_point, point) < 500 AND action = 'DETECTION' THEN 1 END) AS CUMUL_MOIN_500_DETECTION,
+                COUNT(CASE WHEN LENGTH(mra_contrat) > 6 AND ST_Distance_Sphere(mra_point, point) >= 500 AND action = 'DETECTION' THEN 1 END) AS CUMUL_PLUS_500_DETECTION,
+                COUNT(CASE WHEN LENGTH(mra_contrat) <= 6 AND action = 'DETECTION' THEN 1 END) AS CUMUL_NON_IDENTIFIE_DETECTION,
+
+                COUNT(CASE WHEN LENGTH(mra_contrat) > 6 AND ST_Distance_Sphere(mra_point, point) < 500 AND action = 'DISTRIBUTION' THEN 1 END) AS CUMUL_MOIN_500_DISTRIBUTION,
+                COUNT(CASE WHEN LENGTH(mra_contrat) > 6 AND ST_Distance_Sphere(mra_point, point) >= 500 AND action = 'DISTRIBUTION' THEN 1 END) AS CUMUL_PLUS_500_DISTRIBUTION,
+                COUNT(CASE WHEN LENGTH(mra_contrat) <= 6 AND action = 'DISTRIBUTION' THEN 1 END) AS CUMUL_NON_IDENTIFIE_DISTRIBUTION,
+
+                COUNT(CASE WHEN LENGTH(mra_contrat) > 6 AND ST_Distance_Sphere(mra_point, point) < 500 AND action = 'INSPECTION' THEN 1 END) AS CUMUL_MOIN_500_INSPECTION,
+                COUNT(CASE WHEN LENGTH(mra_contrat) > 6 AND ST_Distance_Sphere(mra_point, point) >= 500 AND action = 'INSPECTION' THEN 1 END) AS CUMUL_PLUS_500_INSPECTION,
+                COUNT(CASE WHEN LENGTH(mra_contrat) <= 6 AND action = 'INSPECTION' THEN 1 END) AS CUMUL_NON_IDENTIFIE_INSPECTION,
+
+                COUNT(CASE WHEN LENGTH(mra_contrat) > 6 AND ST_Distance_Sphere(mra_point, point) < 500 AND action = 'NEW METER' THEN 1 END) AS CUMUL_MOIN_500_NEW_METER,
+                COUNT(CASE WHEN LENGTH(mra_contrat) > 6 AND ST_Distance_Sphere(mra_point, point) >= 500 AND action = 'NEW METER' THEN 1 END) AS CUMUL_PLUS_500_NEW_METER,
+                COUNT(CASE WHEN LENGTH(mra_contrat) <= 6 AND action = 'NEW METER' THEN 1 END) AS CUMUL_NON_IDENTIFIE_NEW_METER,
+
+                COUNT(CASE WHEN LENGTH(mra_contrat) > 6 AND ST_Distance_Sphere(mra_point, point) < 500 AND action = 'NORMALISATION' THEN 1 END) AS CUMUL_MOIN_500_NORMALISATION,
+                COUNT(CASE WHEN LENGTH(mra_contrat) > 6 AND ST_Distance_Sphere(mra_point, point) >= 500 AND action = 'NORMALISATION' THEN 1 END) AS CUMUL_PLUS_500_NORMALISATION,
+                COUNT(CASE WHEN LENGTH(mra_contrat) <= 6 AND action = 'NORMALISATION' THEN 1 END) AS CUMUL_NON_IDENTIFIE_NORMALISATION,
+
+                COUNT(CASE WHEN LENGTH(mra_contrat) > 6 AND ST_Distance_Sphere(mra_point, point) < 500 AND action = 'RECOUVREMENT' THEN 1 END) AS CUMUL_MOIN_500_RECOUVREMENT,
+                COUNT(CASE WHEN LENGTH(mra_contrat) > 6 AND ST_Distance_Sphere(mra_point, point) >= 500 AND action = 'RECOUVREMENT' THEN 1 END) AS CUMUL_PLUS_500_RECOUVREMENT,
+                COUNT(CASE WHEN LENGTH(mra_contrat) <= 6 AND action = 'RECOUVREMENT' THEN 1 END) AS CUMUL_NON_IDENTIFIE_RECOUVREMENT,
+
+                COUNT(CASE WHEN LENGTH(mra_contrat) > 6 AND ST_Distance_Sphere(mra_point, point) < 500 AND action = 'RELEVE' THEN 1 END) AS CUMUL_MOIN_500_RELEVE,
+                COUNT(CASE WHEN LENGTH(mra_contrat) > 6 AND ST_Distance_Sphere(mra_point, point) >= 500 AND action = 'DEPANRELEVENAGE' THEN 1 END) AS CUMUL_PLUS_500_RELEVE,
+                COUNT(CASE WHEN LENGTH(mra_contrat) <= 6 AND action = 'RELEVE' THEN 1 END) AS CUMUL_NON_IDENTIFIE_RELEVE,
+
+                COUNT(CASE WHEN LENGTH(mra_contrat) > 6 AND ST_Distance_Sphere(mra_point, point) < 500 AND action = 'BRANCHEMENT' THEN 1 END) AS CUMUL_MOIN_500_BRANCHEMENT,
+                COUNT(CASE WHEN LENGTH(mra_contrat) > 6 AND ST_Distance_Sphere(mra_point, point) >= 500 AND action = 'BRANCHEMENT' THEN 1 END) AS CUMUL_PLUS_500_BRANCHEMENT,
+                COUNT(CASE WHEN LENGTH(mra_contrat) <= 6 AND action = 'BRANCHEMENT' THEN 1 END) AS CUMUL_NON_IDENTIFIE_BRANCHEMENT,
+
+                SUM(CASE WHEN SUBSTRING_INDEX(`date_filtre_telechargement`, '-', -1) = '01' THEN 1 ELSE 0 END) AS J1, 
+                SUM(CASE WHEN SUBSTRING_INDEX(`date_filtre_telechargement`, '-', -1) = '02' THEN 1 ELSE 0 END) AS J2, 
+                SUM(CASE WHEN SUBSTRING_INDEX(`date_filtre_telechargement`, '-', -1) = '03' THEN 1 ELSE 0 END) AS J3, 
+                SUM(CASE WHEN SUBSTRING_INDEX(`date_filtre_telechargement`, '-', -1) = '04' THEN 1 ELSE 0 END) AS J4, 
+                SUM(CASE WHEN SUBSTRING_INDEX(`date_filtre_telechargement`, '-', -1) = '05' THEN 1 ELSE 0 END) AS J5, 
+                SUM(CASE WHEN SUBSTRING_INDEX(`date_filtre_telechargement`, '-', -1) = '06' THEN 1 ELSE 0 END) AS J6, 
+                SUM(CASE WHEN SUBSTRING_INDEX(`date_filtre_telechargement`, '-', -1) = '07' THEN 1 ELSE 0 END) AS J7, 
+                SUM(CASE WHEN SUBSTRING_INDEX(`date_filtre_telechargement`, '-', -1) = '08' THEN 1 ELSE 0 END) AS J8, 
+                SUM(CASE WHEN SUBSTRING_INDEX(`date_filtre_telechargement`, '-', -1) = '09' THEN 1 ELSE 0 END) AS J9, 
+                SUM(CASE WHEN SUBSTRING_INDEX(`date_filtre_telechargement`, '-', -1) = '10' THEN 1 ELSE 0 END) AS J10, 
+                SUM(CASE WHEN SUBSTRING_INDEX(`date_filtre_telechargement`, '-', -1) = '11' THEN 1 ELSE 0 END) AS J11, 
+                SUM(CASE WHEN SUBSTRING_INDEX(`date_filtre_telechargement`, '-', -1) = '12' THEN 1 ELSE 0 END) AS J12, 
+                SUM(CASE WHEN SUBSTRING_INDEX(`date_filtre_telechargement`, '-', -1) = '13' THEN 1 ELSE 0 END) AS J13, 
+                SUM(CASE WHEN SUBSTRING_INDEX(`date_filtre_telechargement`, '-', -1) = '14' THEN 1 ELSE 0 END) AS J14, 
+                SUM(CASE WHEN SUBSTRING_INDEX(`date_filtre_telechargement`, '-', -1) = '15' THEN 1 ELSE 0 END) AS J15, 
+                SUM(CASE WHEN SUBSTRING_INDEX(`date_filtre_telechargement`, '-', -1) = '16' THEN 1 ELSE 0 END) AS J16, 
+                SUM(CASE WHEN SUBSTRING_INDEX(`date_filtre_telechargement`, '-', -1) = '17' THEN 1 ELSE 0 END) AS J17, 
+                SUM(CASE WHEN SUBSTRING_INDEX(`date_filtre_telechargement`, '-', -1) = '18' THEN 1 ELSE 0 END) AS J18, 
+                SUM(CASE WHEN SUBSTRING_INDEX(`date_filtre_telechargement`, '-', -1) = '19' THEN 1 ELSE 0 END) AS J19, 
+                SUM(CASE WHEN SUBSTRING_INDEX(`date_filtre_telechargement`, '-', -1) = '20' THEN 1 ELSE 0 END) AS J20, 
+                SUM(CASE WHEN SUBSTRING_INDEX(`date_filtre_telechargement`, '-', -1) = '21' THEN 1 ELSE 0 END) AS J21, 
+                SUM(CASE WHEN SUBSTRING_INDEX(`date_filtre_telechargement`, '-', -1) = '22' THEN 1 ELSE 0 END) AS J22, 
+                SUM(CASE WHEN SUBSTRING_INDEX(`date_filtre_telechargement`, '-', -1) = '23' THEN 1 ELSE 0 END) AS J23, 
+                SUM(CASE WHEN SUBSTRING_INDEX(`date_filtre_telechargement`, '-', -1) = '24' THEN 1 ELSE 0 END) AS J24, 
+                SUM(CASE WHEN SUBSTRING_INDEX(`date_filtre_telechargement`, '-', -1) = '25' THEN 1 ELSE 0 END) AS J25, 
+                SUM(CASE WHEN SUBSTRING_INDEX(`date_filtre_telechargement`, '-', -1) = '26' THEN 1 ELSE 0 END) AS J26, 
+                SUM(CASE WHEN SUBSTRING_INDEX(`date_filtre_telechargement`, '-', -1) = '27' THEN 1 ELSE 0 END) AS J27, 
+                SUM(CASE WHEN SUBSTRING_INDEX(`date_filtre_telechargement`, '-', -1) = '28' THEN 1 ELSE 0 END) AS J28, 
+                SUM(CASE WHEN SUBSTRING_INDEX(`date_filtre_telechargement`, '-', -1) = '29' THEN 1 ELSE 0 END) AS J29, 
+                SUM(CASE WHEN SUBSTRING_INDEX(`date_filtre_telechargement`, '-', -1) = '30' THEN 1 ELSE 0 END) AS J30, 
+                SUM(CASE WHEN SUBSTRING_INDEX(`date_filtre_telechargement`, '-', -1) = '31' THEN 1 ELSE 0 END) AS J31 
+            FROM `tmp_chargement_odk` 
+            GROUP BY `ref_formulaire`, `agence_liee`, SUBSTRING(`date_filtre_telechargement`, 1, 7)
+            ON DUPLICATE KEY UPDATE 
+                total = VALUES(total),
+                last_realisation = VALUES(last_realisation),
+                last_submit = VALUES(last_submit),
+                CUMUL_DEPANNAGE = VALUES(CUMUL_DEPANNAGE),
+                CUMUL_DETECTION = VALUES(CUMUL_DETECTION),
+                CUMUL_DISTRIBUTION = VALUES(CUMUL_DISTRIBUTION),
+                CUMUL_INSPECTION = VALUES(CUMUL_INSPECTION),
+                CUMUL_NEW_METER = VALUES(CUMUL_NEW_METER),
+                CUMUL_NORMALISATION = VALUES(CUMUL_NORMALISATION),
+                CUMUL_RECOUVREMENT = VALUES(CUMUL_RECOUVREMENT),
+                CUMUL_RELEVE = VALUES(CUMUL_RELEVE),
+                CUMUL_BRANCHEMENT = VALUES(CUMUL_BRANCHEMENT);
+
         """
         # =====================================================================
         # SECTION 3 : LOGS D'IMPORTATION
@@ -502,6 +661,572 @@ def charger(result: list, date: str, heure: str, form: str, connection, connecti
     finally:
         # Les contextes 'with' gèrent la fermeture des curseurs automatiquement.
         pass
+
+def charger(result: list, date: str, heure: str, form: str, connection, connection_master, is_pg):
+    """
+    Insère en masse (Bulk Insert) les données CSV, images et logs dans la base MySQL et Postgres (Master).
+    Gère la mise à jour des doublons via ON DUPLICATE KEY UPDATE / ON CONFLICT.
+    
+    :param connection: Une connexion active retournée par pymysql.connect()
+    :param connection_master: Une connexion active vers la base master
+    """
+    result_jpg = result[2] if len(result) > 2 else []
+    result_csv = result[1] if len(result) > 1 else []
+
+    try:
+        # =========================================================================
+        # SECTION 1 : TRAITEMENT ET CHARGEMENT DES DONNÉES CSV EN LOCAL
+        # =========================================================================
+        if result_csv:
+            # 1. Liste stricte de toutes les colonnes de votre table (incluant 'point')
+            colonnes_csv = [
+                'SubmissionDate', 'entreprise_collecteur', 'collecteur', 'matricule_co', 'source', 'depart', 'poste', 'Type_de_poste', 'photo_poste', 'nbr_depart',
+                'code_depart', 'Eclairage', 'lumiere', 'photo_lanterne', 'existence', 'telephone', 'qualite', 'accesibilite', 'pl_codes_barcodes', 'pl_code_bare',
+                'pl_raison', 'pl_status', 'pl_type_compteur', 'pl_nbr_fil', 'pl_batiment', 'pl_type_immeuble', 'pl_mode_alimentation', 'pl_section_cable',
+                'pl_activite', 'pl_serial_numbers_list', 'pl_serial_number', 'contrat', 'pl_index', 'pl_photo_index',
+                'coordonnee_Latitude', 'coordonnee_Longitude', 'coordonnee_Altitude', 'coordonnee_Accuracy', 'action', 'photo', 'code_anomaly',
+                'I1_entre', 'I2_entre', 'I3_entre', 'I4_entre', 'I1_sortie', 'I2_sortie', 'I3_sortie', 'I4_sortie', 'id', 'uuid', 'date_jour', 'note', 'instanceID',
+                'cle', 'SubmitterID', 'SubmitterName', 'AttachmentsPresent', 'AttachmentsExpected', 'Status', 'ReviewState', 'DeviceID', 'Edits', 'FormVersion', 'ajout_telephone',
+                'agence_liee', 'banoc_code', 'date_submission', 'form', 'ref_formulaire', 'date_filtre_telechargement', 'heure_date_filtre_telechargement',
+                'bloc', 'mra_contrat', 'mra_compteur', 'mra_pl', 'point'
+            ]
+
+            tuples_csv = []
+            for r in result_csv:
+                ligne = []
+                for col in colonnes_csv[:-1]:
+                    valeur_colonne = r.get(col, '')
+                    if isinstance(valeur_colonne, list):
+                        valeur_colonne = valeur_colonne[0] if valeur_colonne else ''
+                    ligne.append(valeur_colonne)
+                    
+                # Extraction sécurisée des coordonnées géospatiales
+                try:
+                    lat_raw = r.get('coordonnee_Latitude', 0)
+                    lng_raw = r.get('coordonnee_Longitude', 0)
+                    lat_val = float(lat_raw[0] if isinstance(lat_raw, list) else (lat_raw or 0))
+                    lng_val = float(lng_raw[0] if isinstance(lng_raw, list) else (lng_raw or 0))
+                except (ValueError, TypeError):
+                    lat_val, lng_val = 0.0, 0.0
+                
+                wkt_point = f"POINT({lng_val} {lat_val})" if lat_val != 0.0 and lng_val != 0.0 else "POINT(0 0)"
+                ligne.append(wkt_point)
+                tuples_csv.append(tuple(ligne))
+
+            # 2. Construction dynamique des marqueurs (%s)
+            placeholders = ["%s"] * (len(colonnes_csv) - 1)
+            string_placeholders_master = ", ".join(placeholders) + ", ST_GeomFromText(%s, 4326)"
+            string_placeholders = ", ".join(placeholders) + ", %s"
+                
+            # 3. Requêtes SQL optimisées
+            sql_csv = f"INSERT INTO tmp_chargement_odk ({', '.join(colonnes_csv)}) VALUES ({string_placeholders}) ON DUPLICATE KEY UPDATE action = VALUES(action), pl_serial_number = VALUES(pl_serial_number), coordonnee_Latitude = VALUES(coordonnee_Latitude), coordonnee_Longitude = VALUES(coordonnee_Longitude), coordonnee_Altitude = VALUES(coordonnee_Altitude), coordonnee_Accuracy = VALUES(coordonnee_Accuracy);"
+            
+            if is_pg:
+                sql_csv_master = f"INSERT INTO tmp_chargement_odk ({', '.join(colonnes_csv)}) VALUES ({string_placeholders_master}) ON CONFLICT (id) DO UPDATE SET action = EXCLUDED.action, pl_serial_number = EXCLUDED.pl_serial_number, coordonnee_Latitude = EXCLUDED.coordonnee_Latitude, coordonnee_Longitude = EXCLUDED.coordonnee_Longitude, coordonnee_Altitude = EXCLUDED.coordonnee_Altitude, coordonnee_Accuracy = EXCLUDED.coordonnee_Accuracy;"
+            else:
+                sql_csv_master = f"INSERT INTO tmp_chargement_odk ({', '.join(colonnes_csv)}) VALUES ({string_placeholders_master}) ON DUPLICATE KEY UPDATE action = VALUES(action), pl_serial_number = VALUES(pl_serial_number), coordonnee_Latitude = VALUES(coordonnee_Latitude), coordonnee_Longitude = VALUES(coordonnee_Longitude), coordonnee_Altitude = VALUES(coordonnee_Altitude), coordonnee_Accuracy = VALUES(coordonnee_Accuracy);"
+                            
+            # 4. Insertion par lots en local MySQL
+            if is_connection_open(connection):
+                with connection.cursor() as cursor_csv:
+                    for i in range(0, len(tuples_csv), 1000):
+                        lot_actuel = tuples_csv[i:i + 1000]
+                        try:
+                            lignes_aff = cursor_csv.executemany(sql_csv, lot_actuel)
+                            print(f"⚡ [CSV LOCAL] Lot {i // 1000 + 1} envoyé ({len(lot_actuel)} lignes). Affectées : {lignes_aff}")
+                        except pymysql.MySQLError as e:
+                            connection.rollback()
+                            print(f"❌ Erreur MySQL lors du lot CSV {i // 1000 + 1}: {e}")
+                            raise e
+                connection.commit()
+                print("💾 [SUCCESS] Toutes les données CSV locales ont été validées sur le disque.")
+            # =========================================================================
+            # SECTION 1B : CHARGEMENT DES DONNÉES CSV SUR LE MASTER (Sécurisé SSL)
+            # =========================================================================
+            if connection_master and is_connection_open(connection_master):
+                try:
+                    # 🟢 PROTECTION SSL NEON : On intercepte les fermetures inattendues de sockets distantes
+                    if hasattr(connection_master, 'closed') and connection_master.closed:
+                        print("⚠️ La connexion SSL master est fermée. Phase d'insertion CSV MASTER ignorée.")
+                    else:
+                        # 1. Configuration dynamique du SGBD (PostgreSQL vs MySQL)
+                        #is_pg = 'psycopg2' in globals() and psycopg2 is not None and isinstance(connection_master, psycopg2.extensions.connection)
+                        
+                        sgbd_nom = "Postgres" if is_pg else "MySQL"
+                        #sql_to_execute = sql_csv_master if is_pg else sql_csv
+
+                        # 2. Exécution factorisée par lots (Batches)
+                        with connection_master.cursor() as cursor_csv_master:
+                            for i in range(0, len(tuples_csv), 1000):
+                                lot_actuel = tuples_csv[i:i + 1000]
+                                cursor_csv_master.executemany(sql_csv_master, lot_actuel)
+                                print(f"⚡ [{sgbd_nom} MASTER] Lot {i // 1000 + 1} envoyé ({len(lot_actuel)} lignes).")
+                        
+                        connection_master.commit()
+                        print(f"💾 [SUCCESS] Tout le lot de {len(tuples_csv)} lignes CSV MASTER a été validé et écrit.")
+                        
+                except (Exception, psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+                    print(f"❌ Erreur critique détectée lors de l'écriture CSV master : {e}")
+                    try:
+                        connection_master.rollback()
+                    except Exception:
+                        pass
+
+            """
+            if connection_master and is_connection_open(connection_master):
+                try:
+                    # 🟢 PROTECTION SSL NEON : On intercepte les fermetures inattendues de sockets distantes
+                    if hasattr(connection_master, 'closed') and connection_master.closed:
+                        print("⚠️ La connexion SSL master est fermée. Phase d'insertion CSV MASTER ignorée.")
+                    else:
+                        # Support PostgreSQL (psycopg2)
+                        if 'psycopg2' in globals() and psycopg2 is not None and isinstance(connection_master, psycopg2.extensions.connection):
+                            with connection_master.cursor() as cursor_csv_master:
+                                for i in range(0, len(tuples_csv), 1000):
+                                    lot_actuel = tuples_csv[i:i + 1000]
+                                    cursor_csv_master.executemany(sql_csv_master, lot_actuel)
+                                    print(f"⚡ [Postgres MASTER] Lot {i // 1000 + 1} envoyé ({len(lot_actuel)} lignes).")
+                        # Support MySQL (pymysql)
+                        else:
+                            with connection_master.cursor() as cursor_csv_master:
+                                for i in range(0, len(tuples_csv), 1000):
+                                    lot_actuel = tuples_csv[i:i + 1000]
+                                    cursor_csv_master.executemany(sql_csv, lot_actuel)
+                                    print(f"⚡ [MySQL MASTER] Lot {i // 1000 + 1} envoyé ({len(lot_actuel)} lignes).")
+                        
+                        connection_master.commit()
+                        print(f"💾 [SUCCESS] Tout le lot de {len(tuples_csv)} lignes CSV MASTER a été validé et écrit.")
+                except (Exception, psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+                    print(f"❌ Erreur critique détectée lors de l'écriture CSV master : {e}")
+                    try:
+                        connection_master.rollback()
+                    except Exception:
+                        pass
+            """
+        # =====================================================================
+        # SECTION 2 : CHARGEMENT DES IMAGES (JPG)
+        # =====================================================================
+        if result_jpg:
+            sql_image = "INSERT INTO image (form, date, heure, nom, taille) VALUES (%s, %s, %s, %s, %s) ON DUPLICATE KEY UPDATE nom = VALUES(nom);"
+            if is_pg:
+                sql_image_master = "INSERT INTO image (form, date, heure, nom, taille) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (nom) DO UPDATE SET nom = EXCLUDED.nom;"
+            else:
+                sql_image_master = "INSERT INTO image (form, date, heure, nom, taille) VALUES (%s, %s, %s, %s, %s) ON DUPLICATE KEY UPDATE nom = VALUES(nom);"
+                                
+            
+            tuples_jpg = [(r['form'], r['date'], r['heure'], r['nom'], r['taille']) for r in result_jpg]
+
+            # 1. Insertion locale des images
+            if False and is_connection_open(connection):
+                try:
+                    with connection.cursor() as cursor_image_local:
+                        for i in range(0, len(tuples_jpg), 1000):
+                            lot_actuel = tuples_jpg[i:i + 1000]
+                            cursor_image_local.executemany(sql_image, lot_actuel)
+                    connection.commit()
+                    print(f"💾 [SUCCESS] Les {len(tuples_jpg)} images locales ont été validées.")
+                except Exception as e_img_loc:
+                    connection.rollback()
+                    print(f"❌ Erreur lors de l'insertion locale des images : {e_img_loc}")
+
+            # 2. Insertion master des images
+            if connection_master and is_connection_open(connection_master):
+                try:
+                    if hasattr(connection_master, 'closed') and connection_master.closed:
+                        print("⚠️ Connexion SSL master fermée. Écriture des images MASTER ignorée.")
+                    else:
+                        # Configuration dynamique de la requête selon le SGBD (PostgreSQL vs MySQL)
+                        #is_pg = 'psycopg2' in globals() and psycopg2 is not None and isinstance(connection_master, psycopg2.extensions.connection)
+                        #sql_to_execute = sql_image_master if is_pg else sql_image
+
+                        # Exécution factorisée par lots
+                        with connection_master.cursor() as cursor_master:
+                            for i in range(0, len(tuples_jpg), 1000):
+                                lot_actuel = tuples_jpg[i:i + 1000]
+                                cursor_master.executemany(sql_image_master, lot_actuel)
+                                
+                        connection_master.commit()
+                        print(f"💾 [SUCCESS] Les {len(tuples_jpg)} images MASTER ont été écrites physiquement.")
+                except Exception as error_img:
+                    print(f"❌ Erreur critique lors de l'écriture des images master : {error_img}")
+                    try:
+                        connection_master.rollback()
+                    except Exception:
+                        pass
+
+        """
+        if result_jpg:
+            sql_image = "INSERT INTO image (form, date, heure, nom, taille) VALUES (%s, %s, %s, %s, %s) ON DUPLICATE KEY UPDATE nom = VALUES(nom);"
+            sql_image_master = "INSERT INTO image (form, date, heure, nom, taille) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (nom) DO UPDATE SET nom = EXCLUDED.nom;"
+               
+            tuples_jpg = [(r['form'], r['date'], r['heure'], r['nom'], r['taille']) for r in result_jpg]
+
+            # 1. Insertion locale des images
+            if is_connection_open(connection):
+                try:
+                    with connection.cursor() as cursor_image_local:
+                        for i in range(0, len(tuples_jpg), 1000):
+                            lot_actuel = tuples_jpg[i:i + 1000]
+                            cursor_image_local.executemany(sql_image, lot_actuel)
+                    connection.commit()
+                    print(f"💾 [SUCCESS] Les {len(tuples_jpg)} images locales ont été validées.")
+                except Exception as e_img_loc:
+                    connection.rollback()
+                    print(f"❌ Erreur lors de l'insertion locale des images : {e_img_loc}")
+
+            # 2. Insertion master des images
+            if connection_master and is_connection_open(connection_master):
+                try:
+                    if hasattr(connection_master, 'closed') and connection_master.closed:
+                        print("⚠️ Connexion SSL master fermée. Écriture des images MASTER ignorée.")
+                    else:
+                        if 'psycopg2' in globals() and psycopg2 is not None and isinstance(connection_master, psycopg2.extensions.connection):
+                            with connection_master.cursor() as cursor_master:
+                                for i in range(0, len(tuples_jpg), 1000):
+                                    lot_actuel = tuples_jpg[i:i + 1000]
+                                    cursor_master.executemany(sql_image_master, lot_actuel)
+                        else:
+                            with connection_master.cursor() as cursor_master:
+                                for i in range(0, len(tuples_jpg), 1000):
+                                    lot_actuel = tuples_jpg[i:i + 1000]
+                                    cursor_master.executemany(sql_image, lot_actuel)
+                        connection_master.commit()
+                        print(f"💾 [SUCCESS] Les {len(tuples_jpg)} images MASTER ont été écrites physiquement.")
+                except Exception as error_img:
+                    print(f"❌ Erreur critique lors de l'écriture des images master : {error_img}")
+                    try:
+                        connection_master.rollback()
+                    except Exception:
+                        pass
+        """
+
+        # =====================================================================
+        # SECTION 4 : LOGS D'IMPORTATION & EXÉCUTION DU GÉOMARKETING
+        # =====================================================================
+        limite_temps = datetime.now() - timedelta(hours=2)
+        date_time_ligne = datetime.strptime(f"{date} {heure}:00:00", "%Y-%m-%d %H:%M:%S")
+            
+        if date_time_ligne <= limite_temps:
+            sql_logs = "INSERT INTO logs_importation_odk (form, date, heure) VALUES (%s, %s, %s) ON DUPLICATE KEY UPDATE form = VALUES(form);"
+            if is_pg:
+                sql_logs_master = "INSERT INTO logs_importation_odk (form, date, heure, qte_csv, qte_image, update_at) VALUES (%s, %s, %s, %s, %s, NOW()) ON CONFLICT (form, date, heure) DO UPDATE SET qte_csv = EXCLUDED.qte_csv, qte_image = EXCLUDED.qte_image, update_at = NOW();"
+                # =========================================================================
+                # SECTION 3 : REQUÊTES GÉOSPATIALES & RAPPROCHEMENTS MRA (POSTGRESQL MASTER)
+                # =========================================================================
+                """
+                sql_agence_lies = "UPDATE tmp_chargement_odk SET agence_liee = COALESCE(rech.agences_liees, 'non identifie') FROM (SELECT t.cle, string_agg(bc.agency, ';') AS agences_liees FROM tmp_chargement_odk AS t JOIN limites_agences AS bc ON ST_Contains(bc.boundary, ST_GeomFromText('POINT(' || t.coordonnee_Longitude || ' ' || t.coordonnee_Latitude || ')', 4326)) WHERE t.coordonnee_Longitude IS NOT NULL AND t.coordonnee_Latitude IS NOT NULL GROUP BY t.cle) AS rech WHERE tmp_chargement_odk.cle = rech.cle AND (tmp_chargement_odk.agence_liee IS NULL OR tmp_chargement_odk.agence_liee = '');"
+                sql_bloc = "UPDATE tmp_chargement_odk SET bloc = COALESCE(bc.block_code, 'bloc non identifie'), agence_liee = COALESCE(bc.agence, 'agence non identifie') FROM bloc AS bc WHERE ST_Contains(bc.boundary, ST_GeomFromText('POINT(' || tmp_chargement_odk.coordonnee_Longitude || ' ' || tmp_chargement_odk.coordonnee_Latitude || ')', 4326)) AND bc.agency = ANY(string_to_array(tmp_chargement_odk.agence_liee, ';')) AND (tmp_chargement_odk.bloc IS NULL OR tmp_chargement_odk.bloc = '') AND tmp_chargement_odk.coordonnee_Longitude IS NOT NULL AND tmp_chargement_odk.coordonnee_Latitude IS NOT NULL;"
+                sql_mra = "UPDATE tmp_chargement_odk AS target SET mra_contrat = COALESCE(sub.mra_contrat, 'non identifie'), mra_compteur = COALESCE(sub.mra_compteur, 'non identifie'), mra_pl = COALESCE(sub.mra_pl, 'non identifie') FROM (SELECT t.cle, mra.contrat AS mra_contrat, mra.compteur AS mra_compteur, mra.pl AS mra_pl FROM tmp_chargement_odk AS t JOIN bloc AS bc ON t.bloc = bc.block_code JOIN mra AS mra ON (bc.SALESPOINT = mra.code_agence AND (mra.compteur = ANY(string_to_array(t.pl_code_bare, ',')) OR mra.compteur = ANY(string_to_array(t.pl_serial_number, ',')) OR mra.contrat = ANY(string_to_array(t.contrat, ',')))) WHERE (t.ref_formulaire = 'DRC' OR t.ref_formulaire = 'DCUY') AND (t.mra_contrat IS NULL OR t.mra_contrat = '') ORDER BY t.cle ASC LIMIT 10000) AS sub WHERE target.cle = sub.cle;"
+                sql_copier_tmp = "INSERT INTO chargement_odk SELECT t.* FROM tmp_chargement_odk AS t JOIN logs_importation_odk AS l ON t.form = l.form AND t.date_filtre_telechargement = l.date AND t.heure_date_filtre_telechargement = l.heure WHERE LENGTH(t.bloc) > 0 ON CONFLICT (id) DO UPDATE SET form = EXCLUDED.form;"
+                sql_vider_tmp = "DELETE FROM tmp_chargement_odk AS t USING chargement_odk AS l WHERE t.cle = l.cle AND LENGTH(t.bloc) > 0;"
+                """
+                sql_agence_lies = """
+                    UPDATE tmp_chargement_odk 
+                    SET agence_liee = COALESCE(rech.agences_liees, 'non identifie') 
+                    FROM (
+                        SELECT 
+                            t.cle, 
+                            string_agg(bc.agency, ';') AS agences_liees 
+                        FROM tmp_chargement_odk AS t 
+                        JOIN limites_agences AS bc 
+                        ON ST_Contains(
+                                bc.boundary, 
+                                ST_GeomFromText('POINT(' || t.coordonnee_Longitude || ' ' || t.coordonnee_Latitude || ')', 4326)
+                            ) 
+                        WHERE t.coordonnee_Longitude IS NOT NULL 
+                        AND t.coordonnee_Latitude IS NOT NULL 
+                        GROUP BY t.cle
+                    ) AS rech 
+                    WHERE tmp_chargement_odk.cle = rech.cle 
+                    AND (tmp_chargement_odk.agence_liee IS NULL OR tmp_chargement_odk.agence_liee = '');
+                """
+                sql_bloc = """
+                    UPDATE tmp_chargement_odk 
+                    SET bloc = COALESCE(bc.block_code, 'bloc non identifie'), 
+                        agence_liee = COALESCE(bc.agence, 'agence non identifie') 
+                    FROM bloc AS bc 
+                    WHERE ST_Contains(
+                            bc.boundary, 
+                            ST_GeomFromText('POINT(' || tmp_chargement_odk.coordonnee_Longitude || ' ' || tmp_chargement_odk.coordonnee_Latitude || ')', 4326)
+                        ) 
+                    AND bc.agency = ANY(string_to_array(tmp_chargement_odk.agence_liee, ';')) 
+                    AND (tmp_chargement_odk.bloc IS NULL OR tmp_chargement_odk.bloc = '') 
+                    AND tmp_chargement_odk.coordonnee_Longitude IS NOT NULL 
+                    AND tmp_chargement_odk.coordonnee_Latitude IS NOT NULL;
+                """
+                sql_mra = """
+                    UPDATE tmp_chargement_odk AS target 
+                    SET mra_contrat = COALESCE(sub.mra_contrat, 'non identifie'), 
+                        mra_compteur = COALESCE(sub.mra_compteur, 'non identifie'), 
+                        mra_pl = COALESCE(sub.mra_pl, 'non identifie'),
+                        mra_point = CASE 
+                                        WHEN sub.coord_prev IS NOT NULL AND sub.coord_prev != '' THEN 
+                                            ST_GeomFromText(
+                                                'POINT(' || split_part(sub.coord_prev, ' ', 2) || ' ' || split_part(sub.coord_prev, ' ', 1) || ')', 
+                                                4326
+                                            )
+                                        ELSE NULL 
+                                    END 
+                    FROM (
+                        SELECT 
+                            t.cle, 
+                            mra.contrat AS mra_contrat, 
+                            mra.compteur AS mra_compteur, 
+                            mra.pl AS mra_pl,
+                            mra.coord_prev AS mra_coord_prev 
+                        FROM tmp_chargement_odk AS t 
+                        JOIN bloc AS bc 
+                        ON t.bloc = bc.block_code 
+                        JOIN mra AS mra 
+                        ON bc.SALESPOINT = mra.code_agence 
+                        AND (
+                            mra.compteur = ANY(string_to_array(t.pl_code_bare, ',')) 
+                            OR mra.compteur = ANY(string_to_array(t.pl_serial_number, ',')) 
+                            OR mra.contrat = ANY(string_to_array(t.contrat, ','))
+                        ) 
+                        WHERE (t.ref_formulaire = 'DRC' OR t.ref_formulaire = 'DCUY') 
+                        AND (t.mra_contrat IS NULL OR t.mra_contrat = '') 
+                        ORDER BY t.cle ASC 
+                        LIMIT 10000
+                    ) AS sub 
+                    WHERE target.cle = sub.cle;
+                """
+                sql_copier_tmp = """
+                    INSERT INTO chargement_odk 
+                    SELECT t.* 
+                    FROM tmp_chargement_odk AS t 
+                    JOIN logs_importation_odk AS l 
+                    ON t.form = l.form 
+                    AND t.date_filtre_telechargement = l.date 
+                    AND t.heure_date_filtre_telechargement = l.heure 
+                    WHERE LENGTH(t.bloc) > 0 
+                    ON CONFLICT (id) DO UPDATE 
+                    SET form = EXCLUDED.form;
+                """
+                sql_vider_tmp = """
+                    DELETE FROM tmp_chargement_odk AS t 
+                    USING chargement_odk AS l 
+                    WHERE t.cle = l.cle 
+                    AND LENGTH(t.bloc) > 0;
+                """
+
+            else:
+                sql_logs_master = "INSERT INTO logs_importation_odk (form, date, heure, qte_csv, qte_image, update_at) VALUES (%s, %s, %s, %s, %s, NOW()) ON DUPLICATE KEY UPDATE qte_csv = VALUES(qte_csv), qte_image = VALUES(qte_image), update_at = NOW();"
+
+                sql_agence_lies = """
+                    UPDATE tmp_chargement_odk AS target
+                    JOIN (
+                        SELECT t.cle, GROUP_CONCAT(bc.agency SEPARATOR ';') AS agences_liees 
+                        FROM tmp_chargement_odk AS t 
+                        JOIN limites_agences AS bc 
+                        ON ST_Contains(bc.boundary, ST_GeomFromText(CONCAT('POINT(', t.coordonnee_Longitude, ' ', t.coordonnee_Latitude, ')'), 4326)) 
+                        WHERE t.coordonnee_Longitude IS NOT NULL 
+                        AND t.coordonnee_Latitude IS NOT NULL 
+                        GROUP BY t.cle
+                    ) AS rech ON target.cle = rech.cle
+                    SET target.agence_liee = COALESCE(rech.agences_liees, 'non identifie')
+                    WHERE target.agence_liee IS NULL OR target.agence_liee = '';
+                """
+                sql_bloc = """
+                    UPDATE tmp_chargement_odk AS t
+                    JOIN bloc AS bc 
+                    ON ST_Contains(bc.boundary, ST_GeomFromText(CONCAT('POINT(', t.coordonnee_Longitude, ' ', t.coordonnee_Latitude, ')'), 4326))
+                    SET t.bloc = COALESCE(bc.block_code, 'bloc non identifie'), 
+                        t.agence_liee = COALESCE(bc.agence, 'agence non identifie') 
+                    WHERE FIND_IN_SET(bc.agency, REPLACE(t.agence_liee, ';', ',')) > 0
+                    AND (t.bloc IS NULL OR t.bloc = '') 
+                    AND t.coordonnee_Longitude IS NOT NULL 
+                    AND t.coordonnee_Latitude IS NOT NULL;
+                """
+                sql_mra_V0 = """
+                    UPDATE tmp_chargement_odk AS target
+                    JOIN (
+                        SELECT * FROM (
+                            SELECT t.cle, mra.contrat AS mra_contrat, mra.compteur AS mra_compteur, mra.pl AS mra_pl, mra.coord_prev AS mra_coord_prev 
+                            FROM tmp_chargement_odk AS t 
+                            JOIN bloc AS bc ON t.bloc = bc.block_code 
+                            JOIN mra AS mra ON bc.SALESPOINT = mra.code_agence 
+                            AND (
+                                FIND_IN_SET(mra.compteur, t.pl_code_bare) > 0 OR 
+                                FIND_IN_SET(mra.compteur, t.pl_serial_number) > 0 OR 
+                                FIND_IN_SET(mra.contrat, t.contrat) > 0
+                            )
+                            WHERE (t.ref_formulaire = 'DRC' OR t.ref_formulaire = 'DCUY') 
+                            AND (t.mra_contrat IS NULL OR t.mra_contrat = '') 
+                            ORDER BY t.cle ASC 
+                            LIMIT 10000
+                        ) AS sub_drc
+                    ) AS sub ON target.cle = sub.cle
+                    SET target.mra_contrat = COALESCE(sub.mra_contrat, 'non identifie'), 
+                        target.mra_compteur = COALESCE(sub.mra_compteur, 'non identifie'), 
+                        target.mra_pl = COALESCE(sub.mra_pl, 'non identifie')
+                        target.mra_point = IF(
+                                                sub.coord_prev IS NOT NULL AND sub.coord_prev != '',
+                                                ST_GeomFromText(
+                                                    CONCAT(
+                                                        'POINT(', 
+                                                        SUBSTRING_INDEX(sub.coord_prev, ' ', -1), 
+                                                        ' ', 
+                                                        SUBSTRING_INDEX(sub.coord_prev, ' ', 1), 
+                                                        ')'
+                                                    ), 
+                                                    4326
+                                                ),
+                                                NULL 
+                                            )
+                """
+                sql_mra = """
+                    UPDATE tmp_chargement_odk AS target
+                    JOIN (
+                        SELECT * FROM (
+                            SELECT 
+                                t.cle, 
+                                mra.contrat AS mra_contrat, 
+                                mra.compteur AS mra_compteur, 
+                                mra.pl AS mra_pl, 
+                                mra.coord_prev AS mra_coord_prev
+                            FROM tmp_chargement_odk AS t 
+                            JOIN bloc AS bc ON t.bloc = bc.block_code 
+                            JOIN mra AS mra ON bc.SALESPOINT = mra.code_agence 
+                            AND (
+                                FIND_IN_SET(mra.compteur, t.pl_code_bare) > 0 OR 
+                                FIND_IN_SET(mra.compteur, t.pl_serial_number) > 0 OR 
+                                FIND_IN_SET(mra.contrat, t.contrat) > 0
+                            )
+                            WHERE (t.ref_formulaire = 'DRC' OR t.ref_formulaire = 'DCUY') 
+                            AND (t.mra_contrat IS NULL OR t.mra_contrat = '') 
+                            ORDER BY t.cle ASC 
+                            LIMIT 10000
+                        ) AS sub_drc
+                    ) AS sub ON target.cle = sub.cle
+                    SET target.mra_contrat = COALESCE(sub.mra_contrat, 'non identifie'), 
+                        target.mra_compteur = COALESCE(sub.mra_compteur, 'non identifie'), 
+                        target.mra_pl = COALESCE(sub.mra_pl, 'non identifie'),
+                        target.mra_point = IF(
+                                                sub.mra_coord_prev IS NOT NULL AND sub.mra_coord_prev != '', 
+                                                ST_GeomFromText(
+                                                    CONCAT(
+                                                        'POINT(', 
+                                                        SUBSTRING_INDEX(sub.mra_coord_prev, ' ', -1), 
+                                                        ' ', 
+                                                        SUBSTRING_INDEX(sub.mra_coord_prev, ' ', 1), 
+                                                        ')'
+                                                    ), 
+                                                    4326
+                                                ),
+                                                NULL 
+                                            ); 
+                    """
+
+                sql_copier_tmp = """
+                    INSERT INTO chargement_odk 
+                    SELECT t.* 
+                    FROM tmp_chargement_odk AS t 
+                    JOIN logs_importation_odk AS l 
+                    ON t.form = l.form 
+                    AND t.date_filtre_telechargement = l.date 
+                    AND t.heure_date_filtre_telechargement = l.heure 
+                    WHERE CHAR_LENGTH(t.bloc) > 0 
+                    ON DUPLICATE KEY UPDATE form = VALUES(form);
+                """
+                sql_vider_tmp = """
+                    DELETE t 
+                    FROM tmp_chargement_odk AS t
+                    INNER JOIN chargement_odk AS l ON t.cle = l.cle 
+                    WHERE CHAR_LENGTH(t.bloc) > 0;
+                """
+            # 1. Écriture du log en local
+            if is_connection_open(connection):
+                try:
+                    with connection.cursor() as cursor_log:
+                        cursor_log.execute(sql_logs, [form, date, heure])
+                    connection.commit()
+                except Exception as e_log_local:
+                    print(f"⚠️ Impossible d'écrire le log local MySQL : {e_log_local}")
+
+            # 2. Exécution pas à pas des traitements lourds géospatiaux (Postgres/MySQL Master)
+            if connection_master and is_connection_open(connection_master):
+                try:
+                    if hasattr(connection_master, 'closed') and connection_master.closed:
+                        print("⚠️ Connexion SSL master perdue avant la phase de géomarketing. Phase annulée.")
+                    else:
+                        # 2. Configuration des requêtes selon le SGBD
+                        requetes_master = [
+                            ("Géolocalisation agences", sql_agence_lies),
+                            ("Calcul des blocs", sql_bloc),
+                            ("Rapprochement MRA", sql_mra),
+                            ("Copie table finale", sql_copier_tmp),
+                            ("Nettoyage table temporaire", sql_vider_tmp)
+                        ]
+                        sql_final = sql_logs_master
+                        params_final = [form, date, heure, len(result_csv), len(result_jpg)]
+
+                        # 3. Exécution factorisée des traitements séquentiels
+                        with connection_master.cursor() as cursor_log_master:
+                            for nom_req, requete_sql in requetes_master:
+                                try:
+                                    cursor_log_master.execute(requete_sql)
+                                    connection_master.commit()  # Validation par étape pour éviter de bloquer la base
+                                except Exception as e_req:
+                                    print(f"⚠️ Échec sous-étape '{nom_req}' : {e_req}")
+                                    connection_master.rollback()
+                            
+                            # Log de fin d'importation sur le Master (Postgres ou MySQL)
+                            cursor_log_master.execute(sql_final, params_final)
+                            connection_master.commit()
+                            print(f"💾 [SUCCESS] Log de fin d'importation enregistré sur le Master.")
+
+                except Exception as e_master_critique:
+                    print(f"❌ Erreur critique lors des traitements master : {e_master_critique}")
+                    try:
+                        connection_master.rollback()
+                    except Exception:
+                        pass
+
+            """
+            # 2. Exécution pas à pas des traitements lourds géospatiaux (Postgres Master)
+            if connection_master and is_connection_open(connection_master):
+                try:
+                    if hasattr(connection_master, 'closed') and connection_master.closed:
+                        print("⚠️ Connexion SSL master perdue avant la phase de géomarketing. Phase annulée.")
+                    else:
+                        with connection_master.cursor() as cursor_log_master:
+                            if 'psycopg2' in globals() and psycopg2 is not None and isinstance(connection_master, psycopg2.extensions.connection):
+                                requetes_master = [
+                                    ("Géolocalisation agences", sql_agence_lies),
+                                    ("Calcul des blocs", sql_bloc),
+                                    ("Rapprochement MRA", sql_mra),
+                                    ("Copie table finale", sql_copier_tmp),
+                                    ("Nettoyage table temporaire", sql_vider_tmp)
+                                ]
+                                for nom_req, requete_sql in requetes_master:
+                                    try:
+                                        cursor_log_master.execute(requete_sql)
+                                        connection_master.commit()  # Validation par étape pour éviter de bloquer la base
+                                    except Exception as e_req:
+                                        print(f"⚠️ Échec sous-étape '{nom_req}' : {e_req}")
+                                        connection_master.rollback()
+                                
+                                # Log de fin d'importation sur le Master
+                                cursor_log_master.execute(sql_logs_master, [form, date, heure, len(result_csv), len(result_jpg)])
+                                connection_master.commit()
+                            else:
+                                cursor_log_master.execute(sql_logs, [form, date, heure])
+                                connection_master.commit()
+                except (Exception, psycopg2.OperationalError, psycopg2.InterfaceError) as e_master_log:
+                    print(f"❌ Erreur critique lors de la phase finale Master : {e_master_log}")
+                    try:
+                        connection_master.rollback()
+                    except Exception:
+                        pass
+            """    
+            print(f"✅ Logs enregistrés. Données importées : {len(result_jpg)} images et {len(result_csv)} lignes CSV.")
+            
+    except Exception as e_global:
+        print(f"❌ Erreur critique globale non interceptée dans charger() : {e_global}")
+    finally:
+        pass
+
 
 def s(texte: str) -> str:
     """
@@ -930,7 +1655,7 @@ async def traiter_fichier_cloudflare(date_str: str, urls: dict) -> list:
         
         return [valeur_return, tab_csv, tab_jpg, len(tab_csv), len(tab_jpg)]
 
-async def traiter_fichier(date_str: str, urls: dict) -> list:
+async def traiter_fichier_V1(date_str: str, urls: dict, download: str) -> list:
     """
     Ouvre l'archive ZIP directement depuis Cloudflare R2, analyse son fichier CSV 
     en mémoire vive (RAM) et prépare les structures de données sans toucher au disque local.
@@ -1203,6 +1928,285 @@ async def traiter_fichier(date_str: str, urls: dict) -> list:
             valeur_return = False
         
         return [valeur_return, tab_csv, tab_jpg, len(tab_csv), len(tab_jpg)]
+
+async def traiter_fichier(date_str: str, urls: dict, download: str, is_pg) -> list:
+    """
+    Analyse l'archive ZIP d'ODK (en local ou depuis Cloudflare R2), extrait et corrige la structure,
+    puis prépare les listes de données structurées pour l'insertion en BDD.
+    """
+    # --- BLOC 1 : Configuration des correspondances (Mappings) ---
+    tab_pos = {}
+    tab_pos["drsm"] = 0
+    tab_pos["drd"] = 1
+    tab_pos["dre"] = 2
+    tab_pos["Drsano"] = 3
+    tab_pos["drnea"] = 4
+    tab_pos["dry"] = 5
+    tab_pos["drsom"] = 6
+    tab_pos["NORD"] = 7
+    tab_pos["EXTREME-NORD"] = 8
+    tab_pos["ADAMAOUA"] = 9
+    tab_pos["DRC_C"] = 10
+    tab_pos["yde1"] = 11
+    tab_pos["DRC"] = 12
+    tab_pos["drono_"] = 13
+    tab_pos["ratissage_drd_2025"] = 14
+
+    tab_pos["forms"] = ["drsm", "drd", "dre", "Drsano", "drnea", "dry", "drsom", "nord", "EXTREME-NORD", "ADAMAOUA", "drc_c", "yde1", "drc", "drono_", "ratissage_drd_2025"]
+    tab_pos["id"] = ["55", "56", "55", "55", "55", "55", "56", "111", "111", "111", "233", "234", "214", "49", "20"]
+    tab_pos["pl/info_pl/status"] = ["22", "22", "22", "22", "22", "26-60", "23", "19", "19", "19", "238", "239", "219", "54", "25"]
+    tab_pos["pl/info_pl/activite"] = ["29", "29", "29", "29", "29", "33", "30", "", "", "", "25-49-63-77-91-101-141-171-190-199-213", "26-50-64-78-92-102-142-191-200-214", "27-49-61-73-85-93-132-158-175-182-196", "44", ""]
+    tab_pos["pl/info_pl/batiment"] = ["25", "25", "25", "25", "25", "29", "26", "23", "23", "23", "137-169-188", "138-170-189", "128-156-173", "", "13"]
+    tab_pos["pl/info_pl/nbr_fil"] = ["24", "24", "24", "24", "24", "28", "25", "28", "28", "28", "28-136-168-187", "29-137-169-188", "29-127-155-172", "24", ""]
+    tab_pos["pl/info_pl/code_bare"] = ["20", "20", "20", "20", "20", "24", "21", "31-38-73", "31-38-73", "31-38-73", "33-56-70-84-94-103-143-163-179-195-215", "34-57-71-85-95-104-144-164-180-196-216", "33-54-66-78-87-95-134-152-166-180-198", "26-37", "6"]
+    tab_pos["pl/info_pl/photo_index"] = ["34", "34", "34", "34", "34", "38", "35", "48", "48", "48", "43-147-165-181", "44-148-166-182", "43-136-153-167", "27-41", "16"]
+    tab_pos["pl/info_pl/serial_number"] = ["31", "31", "31", "31", "31", "34-35", "32", "33-37-42-72", "33-37-42-72", "33-37-42-72", "180-196-216", "181-197-217", "8", "33-34-38", "7"]
+    tab_pos["pl/info_pl/type_compteur"] = ["23", "23", "23", "23", "23", "27", "24", "29", "29", "29", "26-50-64-78-92-102-135-161-177-193", "27-51-65-79-93-103-136-162-178-194", "28-50-62-74-86-94-126-150-164-178", "22", "5"]
+    tab_pos["pl/info_pl/index"] = ["33", "33", "33", "33", "33", "37", "24", "44", "44", "44", "32-34-68-82-96-146-166-182-183-184-185-197", "33-35-69-83-97-147-167-183-184-185-186-198", "32-34-65-77-89-135-154-168-169-170-171-181", "35-40", ""]
+    tab_pos["pl/info_pl/raison"] = ["21", "21", "21", "21", "21", "25", "22", "32", "32", "32", "218", "219", "199", "", ""]
+    tab_pos["pl/info_pl/contrat"] = ["32", "32", "32", "32", "32", "36", "33", "35", "35", "35", "27-52-66-80-97-117-145-167-186-198-217", "28-53-67-81-98-118-146-168-187-199-218", "9", "43", ""]
+    tab_pos["pl/info_pl/image_url"] = ["", "", "", "", "", "", "", "", "", "", "", "", "", "", ""]
+    tab_pos["date"] = ["1", "1", "1", "1", "1", "1", "1", "1", "1", "1", "1", "1", "1", "1", "0"]
+    tab_pos["action"] = ["39", "39", "39", "39", "39", "39", "40", "6", "6", "6", "5", "5", "5", "15", ""]
+    tab_pos["nbr_pl"] = ["", "", "", "", "", "", "", "", "", "", "", "", "", "", ""]
+    tab_pos["contrat"] = ["32", "32", "32", "32", "32", "36", "33", "35", "35", "35", "27-52-66-80-97-117-145-167-186-198-217", "28-53-67-81-98-118-146-168-187-199-218", "9", "43", ""]
+    tab_pos["montant"] = ["", "", "", "", "", "", "", "", "", "", "53-67-81-222", "54-68-82-223", "52-64-76-203", "20", ""]
+    tab_pos["Collecteur"] = ["3", "3", "3", "3", "3", "7", "3", "7", "7", "7", "6", "6", "6", "3", "4-22"]
+    tab_pos["_geolocation"] = ["35-36-37-38", "35-36-37-38", "35-36-37-38", "35-36-37-38", "35-36-37-38", "2-3-4-5", "36-37-38-39", "93-94-95-96", "93-94-95-96", "93-94-95-96", "16-17-18-19", "17-18-19-20", "18-19-20-21", "6-7-8-9", "9-10-11-12"]
+    tab_pos["source"] = ["5", "5", "5", "5", "5", "9", "6", "12", "12", "12", "21-120", "22-121", "23-111", "", ""]
+    tab_pos["depart"] = ["6", "6", "6", "6", "6", "10", "7", "13", "13", "13", "22-121", "23-122", "24-112", "", ""]
+    tab_pos["poste"] = ["7", "7", "7", "7", "7", "11", "8", "14", "14", "14", "23-122", "24-123", "25-113", "", ""]
+    tab_pos["poste_type"] = ["8", "8", "8", "8", "8", "12", "9", "15", "15", "15", "24-123", "24-124", "26-114", "", ""]
+    tab_pos["poste_image_url"] = ["9", "9", "9", "9", "9", "13", "10", "", "", "", "124", "125", "115", "", ""]
+    tab_pos["depart_nbr"] = ["10", "10", "10", "10", "10", "14", "11", "", "", "", "125", "126", "116", "", ""]
+    tab_pos["depart_code"] = ["11", "11", "11", "11", "11", "15", "12", "", "", "", "126", "127", "117", "", ""]
+    tab_pos["existence"] = ["15", "15", "15", "15", "15", "19", "16", "", "", "", "130", "131", "121", "", ""]
+    tab_pos["telephone"] = ["16", "16", "16", "16", "16", "20", "17", "83", "83", "83", "131-158-174-202-209", "132-159-175-203-210", "122-147-161-185-192", "45", "15-15"]
+    tab_pos["quality"] = ["17", "17", "17", "17", "17", "21", "18", "11", "11", "11", "132-159-175", "133-160-176", "123-148-162", "", ""]
+    tab_pos["lighting"] = ["", "", "", "", "", "", "", "", "", "", "", "", "", "", ""]
+    tab_pos["i1_input"] = ["42", "43", "42", "42", "42", "43", "43", "99", "99", "99", "149", "150", "138", "", ""]
+    tab_pos["i1_output"] = ["43", "44", "43", "43", "43", "44", "44", "103", "103", "103", "153", "154", "142", "", ""]
+    tab_pos["i2_input"] = ["44", "45", "44", "44", "44", "45", "45", "100", "100", "100", "150", "151", "139", "", ""]
+    tab_pos["i2_output"] = ["45", "46", "45", "45", "45", "46", "46", "104", "104", "104", "154", "155", "143", "", ""]
+    tab_pos["i3_input"] = ["46", "47", "46", "46", "46", "47", "47", "101", "101", "101", "151", "152", "140", "", ""]
+    tab_pos["i3_output"] = ["47", "48", "47", "47", "47", "48", "48", "105", "105", "105", "155", "156", "144", "", ""]
+    tab_pos["i4_input"] = ["48", "49", "48", "48", "48", "49", "49", "102", "102", "102", "152", "153", "141", "", ""]
+    tab_pos["i4_output"] = ["49", "50", "49", "49", "49", "50", "50", "106", "106", "106", "156", "157", "145", "", ""]
+    tab_pos["accesibilite"] = ["18", "18", "18", "18", "18", "22", "19", "", "", "", "160", "161", "149", "", ""]
+    tab_pos["code_anomaly"] = ["41", "41", "41", "41", "41", "41", "42", "107", "107", "107", "148-172-191-206-212", "149-173-192-207-213", "137-159-176-189-195", "", "17-18"]
+    tab_pos["matricule_co"] = ["", "", "", "", "", "8", "", "8", "8", "8", "7", "7", "7", "", ""]
+    tab_pos["phone_number_co"] = ["16", "16", "16", "16", "16", "", "17", "", "", "", "", "", "", "", ""]
+    tab_pos["numero_scelle"] = ["", "", "", "", "", "", "", "", "", "", "", "", "", "39", ""]
+    tab_pos["action_coupure"] = ["", "", "", "", "", "", "", "6", "6", "6", "", "", "", "", ""]
+    tab_pos["entreprise_collecteur"] = ["2", "2", "2", "2", "2", "6", "2", "9", "9", "9", "14-15", "14-15", "16-17", "14", ""]
+    
+    form_mapping = {
+        "yde1":               {"region": "DCUY",          "action": "infos_generales-ACTION"},
+        "DRC":                {"region": "DRC",           "action": "infos_generales-ACTION"},
+        "DRC_C":              {"region": "DRC",           "action": "infos_generales-ACTION"},
+        "drono_":             {"region": "DRONO",         "action": "Activite_Travail_a_faire"},
+        "EXTREME-NORD":       {"region": "DRNEA",         "action": "ACTION"},
+        "NORD":               {"region": "DRNEA",         "action": "ACTION"},
+        "ADAMAOUA":           {"region": "DRNEA",         "action": "ACTION"},
+        "dry":                {"region": "DCUY",          "action": "action"},
+        "drd":                {"region": "DCUD",          "action": "action"},
+        "T_DRD":              {"region": "T_DRD",         "action": "action"},
+        "dre":                {"region": "DRE",           "action": "action"},
+        "drono":              {"region": "DRONO",         "action": "action"},
+        "Drsano":             {"region": "DRSANO",        "action": "action"},
+        "T_DRSANO":           {"region": "T_DRSANO",      "action": "action"},
+        "drsm":               {"region": "DRSM",          "action": "action"},
+        "drsom":              {"region": "DRSOM",         "action": "action"},
+        "drnea":              {"region": "DRNEA",         "action": "action"},
+        "ratissage_drd_2025": {"region": "DRD_RATISSAGE", "action": "action"}
+    }
+    
+    action_mapping = {
+        "BRANCHEMENT":                    "BRANCHEMENT", "Branchement": "BRANCHEMENT", 
+        "COLLECTE":                       "INSPECTION", "collecte": "INSPECTION", 
+        "DISTRIBUTION":                   "DISTRIBUTION", "Distribution": "DISTRIBUTION", 
+        "INSPECTION":                     "INSPECTION", "Inspection": "INSPECTION", "Collecte": "INSPECTION", 
+        "RECOUVREMENT":                   "RECOUVREMENT", "recouvrement": "RECOUVREMENT", 
+        "RECOUVREMENTBAD_DEBT":           "RECOUVREMENT", "RECOUVREMENTBT": "RECOUVREMENT", "RECOUVREMENTPNT": "RECOUVREMENT", 
+        "Releve":                         "RELEVE", "RELEVE": "RELEVE", "relève": "RELEVE",
+        "DETECTION":                      "DETECTION", "Detection": "DETECTION", "detection": "DETECTION", 
+        "NORMALISATION_ILLEGAUX":         "NORMALISATION", "NORMALISATION": "NORMALISATION", 
+        "ZERO VENDING":                   "ZEROVENDING", "ZEROVENDING": "ZEROVENDING", 
+        "Depannage":                      "DEPANNAGE", "New_Meter": "NEW METER", 
+        "Reouvrement":                    "RECOUVREMENT", "Recouvrement": "RECOUVREMENT", "PNT": "RECOUVREMENT",
+        "CNPC":                           "DETECTION", "Normalisation/illegaux": "NORMALISATION", 
+        "Normalisation":                  "NORMALISATION", "Normalisationillegaux": "NORMALISATION", 
+        "Inspection_Releve/Distribution": "INSPECTION", "Inspection_ReleveDistribution": "INSPECTION", 
+        "Normalisation PNT":              "NORMALISATION", "Recouvrement PNT": "RECOUVREMENT", "NormalisationPNT": "NORMALISATION", 
+        "coupure - remise":               "RECOUVREMENT", "coupureremise": "RECOUVREMENT", 
+        "Visite des OCR":                 "VISITE DES OCR", "Visite des Points de Livraisons": "VISITE DES POINTS DE LIVRAISONS", 
+        "Visite des Postes":              "VISITE DES POSTES", "Visite Ligne BT": "VISITE LIGNE BT", 
+        "Visite Ligne MT":                "VISITE LIGNE MT", "ligne_mt": "VISITE LIGNE MT", 
+        "ocr":                            "VISITE DES OCR", "poste": "VISITE DES POSTES", "RATISSAGE": "RATISSAGE"
+    }
+    
+    valeur_return = False
+    tab_csv = []
+    tab_jpg = []
+
+    zip_path = f"traite/{date_str}/{urls['form']}/{urls['form']} {urls['heure']}h.zip"
+    regex = re.compile(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z.*?collect:[A-Za-z0-9]+,\d+,.*?', re.DOTALL | re.MULTILINE)
+    
+    # --- BLOC 2 : Vérification de l'existence de l'archive ZIP ---
+    existe_sur_r2 = False
+    if download == "serveur":
+        try:
+            s3_client.head_object(Bucket=R2_BUCKET_NAME, Key=zip_path)
+            existe_sur_r2 = True
+        except Exception:
+            existe_sur_r2 = False
+    
+    if (download != "serveur" and not os.path.exists(zip_path)) or (download == "serveur" and not existe_sur_r2):
+        print(f"❌ Impossible d'ouvrir le fichier ZIP. Inexistant : {zip_path}")
+        return [valeur_return, tab_csv, tab_jpg, 0, 0]
+    # --- BLOC 3 : Lecture et Extraction ---
+    try:
+        if download == "serveur":
+            objet_r2 = s3_client.get_object(Bucket=R2_BUCKET_NAME, Key=zip_path)
+            flux_zip_final = io.BytesIO(objet_r2['Body'].read())
+        else:
+            flux_zip_final = zip_path
+        
+        with zipfile.ZipFile(flux_zip_final, 'r') as zip_ref:
+            for file_info in zip_ref.infolist():
+                nom_fichier = file_info.filename
+                taille_octets = file_info.file_size
+
+                if taille_octets == 0 and nom_fichier.endswith('/'):
+                    continue
+                
+                # --- CAS A : Analyse du fichier CSV ---
+                if nom_fichier.lower().endswith('.csv'):
+                    texte = zip_ref.read(nom_fichier).decode('utf-8', errors='ignore')
+                    matches = regex.findall(texte)
+                    
+                    for bloc in matches:
+                        reader = csv.reader([bloc], delimiter=',', quotechar='"')
+                        b_bloc = next(reader)
+                        
+                        lat, lng, alt, acc = 0, 0, 0, 0
+                        geo_val = pos_valeur_matrix("_geolocation", urls["form"], tab_pos, b_bloc, 0)
+                        
+                        if geo_val:
+                            geo_parts = geo_val.split('|')
+                            if len(geo_parts) > 3:
+                                lat, lng, alt, acc = geo_parts[0], geo_parts[1], geo_parts[2], geo_parts[3]
+                                    
+                        date_de_soumission = pos_valeur_matrix("date", urls["form"], tab_pos, b_bloc, 0) or ''
+                        action_brute = pos_valeur_matrix("action", urls["form"], tab_pos, b_bloc, 0)
+                        action_mappee = action_mapping.get(action_brute, action_brute)
+                        
+                        try:
+                            banoc_code = json_geohash_encode(float(lat), float(lng), 8) if (lat and lng) else ''
+                        except ValueError:
+                            banoc_code = ''
+                        
+                        ligne_dictionnaire = {
+                            'SubmissionDate':                     date_de_soumission,
+                            'entreprise_collecteur':               pos_valeur_matrix("entreprise_collecteur", urls["form"], tab_pos, b_bloc, 1) or '',
+                            'collecteur':                          pos_valeur_matrix("Collecteur", urls["form"], tab_pos, b_bloc, 1) or '',
+                            'matricule_co':                        pos_valeur_matrix("matricule_co", urls["form"], tab_pos, b_bloc, 1) or '',
+                            'source':                              pos_valeur_matrix("source", urls["form"], tab_pos, b_bloc, 0) or '',
+                            'depart':                              pos_valeur_matrix("depart", urls["form"], tab_pos, b_bloc, 0) or '',
+                            'poste':                               pos_valeur_matrix("poste", urls["form"], tab_pos, b_bloc, 0) or '',
+                            'Type_de_poste':                       pos_valeur_matrix("poste_type", urls["form"], tab_pos, b_bloc, 0) or '',
+                            'photo_poste':                         pos_valeur_matrix("poste_image_url", urls["form"], tab_pos, b_bloc, 0) or '',
+                            'nbr_depart':                          pos_valeur_matrix("depart_nbr", urls["form"], tab_pos, b_bloc, 0) or '',
+                            'code_depart':                         pos_valeur_matrix("depart_code", urls["form"], tab_pos, b_bloc, 0) or '',
+                            'Eclairage':                           "Eclairage",
+                            'lumiere':                             "lumiere",
+                            'photo_lanterne':                      "photo_lanterne",
+                            'existence':                           pos_valeur_matrix("existence", urls["form"], tab_pos, b_bloc, 0) or '',
+                            'telephone':                           pos_valeur_matrix("telephone", urls["form"], tab_pos, b_bloc, 0) or '',
+                            'qualite':                             pos_valeur_matrix("quality", urls["form"], tab_pos, b_bloc, 0) or '',
+                            'accesibilite':                        pos_valeur_matrix("accesibilite", urls["form"], tab_pos, b_bloc, 0) or '',
+                            'pl_codes_barcodes':                   "codes_barcodes",
+                            'pl_code_bare':                        pos_valeur_matrix("pl/info_pl/code_bare", urls["form"], tab_pos, b_bloc, 1) or '',
+                            'pl_raison':                           pos_valeur_matrix("pl/info_pl/raison", urls["form"], tab_pos, b_bloc, 1) or '',
+                            'pl_status':                           pos_valeur_matrix("pl/info_pl/status", urls["form"], tab_pos, b_bloc, 0) or '',
+                            'pl_type_compteur':                    pos_valeur_matrix("pl/info_pl/type_compteur", urls["form"], tab_pos, b_bloc, 0) or '',
+                            'pl_nbr_fil':                          pos_valeur_matrix("pl/info_pl/nbr_fil", urls["form"], tab_pos, b_bloc, 0) or '',
+                            'pl_batiment':                         pos_valeur_matrix("pl/info_pl/batiment", urls["form"], tab_pos, b_bloc, 0) or '',
+                            'pl_type_immeuble':                    "pl_type_immeuble",
+                            'pl_mode_alimentation':                "mode_alimentation",
+                            'pl_section_cable':                    "section_cable",
+                            'pl_activite':                         pos_valeur_matrix("pl/info_pl/activite", urls["form"], tab_pos, b_bloc, 0) or '',
+                            'pl_serial_numbers_list':              "serial_numbers_list",
+                            'pl_serial_number':                    pos_valeur_matrix("pl/info_pl/serial_number", urls["form"], tab_pos, b_bloc, 1) or '',
+                            'pl_index':                            pos_valeur_matrix("pl/info_pl/index", urls["form"], tab_pos, b_bloc, 0) or '',
+                            'pl_photo_index':                      pos_valeur_matrix("pl/info_pl/photo_index", urls["form"], tab_pos, b_bloc, 0) or '',
+                            'coordonnee_Latitude':                 lat,
+                            'coordonnee_Longitude':                lng,
+                            'coordonnee_Altitude':                 alt,
+                            'coordonnee_Accuracy':                 acc,
+                            'action':                              action_mappee,
+                            'photo':                               pos_valeur_matrix("pl/info_pl/image_url", urls["form"], tab_pos, b_bloc, 0) or '',
+                            'code_anomaly':                        pos_valeur_matrix("code_anomaly", urls["form"], tab_pos, b_bloc, 0) or '',
+                            'I1_entre':                            pos_valeur_matrix("i1_input", urls["form"], tab_pos, b_bloc, 1) or '',
+                            'I2_entre':                            pos_valeur_matrix("i2_input", urls["form"], tab_pos, b_bloc, 1) or '',
+                            'I3_entre':                            pos_valeur_matrix("i3_input", urls["form"], tab_pos, b_bloc, 1) or '',
+                            'I4_entre':                            pos_valeur_matrix("i4_input", urls["form"], tab_pos, b_bloc, 1) or '',
+                            'I1_sortie':                           pos_valeur_matrix("i1_output", urls["form"], tab_pos, b_bloc, 1) or '',
+                            'I2_sortie':                           pos_valeur_matrix("i2_output", urls["form"], tab_pos, b_bloc, 1) or '',
+                            'I3_sortie':                           pos_valeur_matrix("i3_output", urls["form"], tab_pos, b_bloc, 1) or '',
+                            'I4_sortie':                           pos_valeur_matrix("i4_output", urls["form"], tab_pos, b_bloc, 1) or '',
+                            'id':                                  pos_valeur_matrix("id", urls["form"], tab_pos, b_bloc, 0) or '',
+                            'uuid':                                "uuid",
+                            'date_jour':                           pos_valeur_matrix("id", urls["form"], tab_pos, b_bloc, 0) or '',
+                            'note':                                "note",
+                            'instanceID':                          pos_valeur_matrix("id", urls["form"], tab_pos, b_bloc, 0) or '',
+                            'cle':                                 pos_valeur_matrix("id", urls["form"], tab_pos, b_bloc, 0) or '',
+                            'SubmitterID':                         "SubmitterID",
+                            'SubmitterName':                       "SubmitterName",
+                            'AttachmentsPresent':                  "AttachmentsPresent",
+                            'AttachmentsExpected':                 "AttachmentsExpected",
+                            'Status':                              "Status",
+                            'ReviewState':                         "ReviewState",
+                            'DeviceID':                            "DeviceID",
+                            'Edits':                               "Edits",
+                            'FormVersion':                         "FormVersion",
+                            'ajout_telephone':                     "telephone",
+                            'point':                               f"POINT({lng} {lat})",
+                            'agence_liee':                         '',
+                            'banoc_code':                          banoc_code,
+                            'date_submission':                     date_de_soumission[0:10] if date_de_soumission else '',
+                            'form':                                urls.get("form", ""),
+                            'ref_formulaire':                      form_mapping.get(urls["form"], {}).get("region", ""),
+                            'date_filtre_telechargement':          date_str,
+                            'heure_date_filtre_telechargement':    urls.get("heure", ""),
+                            'bloc':                                '',
+                            'mra_contrat':                         '',
+                            'mra_compteur':                        '',
+                            'mra_pl':                              ''
+                        }
+                        tab_csv.append(ligne_dictionnaire)
+                
+                # --- CAS B : Traitement des fichiers Images JPG ---
+                elif nom_fichier.lower().endswith('.jpg'):
+                    nom_nettoye = nom_fichier.replace("media/", "")
+                    donnees_jpg = {
+                        'form':   urls.get("form", ""),
+                        'date':   date_str,
+                        'heure':  urls.get("heure", ""),
+                        'nom':    nom_nettoye,
+                        'taille': taille_octets
+                    }
+                    tab_jpg.append(donnees_jpg)
+                    valeur_return = True
+
+    except zipfile.BadZipFile:
+        print(f"❌ Impossible d'ouvrir le fichier ZIP corrompu. {zip_path}")
+        valeur_return = False
+    except Exception as e:
+        print(f"❌ Erreur critique globale dans traiter_odk : {e}")
+        valeur_return = False
+    
+    return [valeur_return, tab_csv, tab_jpg, len(tab_csv), len(tab_jpg)]
 
 
 def extraire_hors_cloudflare(date_str: str, urls: dict) -> str:
@@ -1704,6 +2708,8 @@ async def telecharger_fichiers(date_str: str, real_urls: list, connexion_bdd):
 
 """
 
+
+
 async def telecharger_un_fichier_hors_cloudflare(client: httpx.AsyncClient, url_info: dict, date_str: str, headers: dict, queue_progression: asyncio.Queue = None):
     """Télécharge un seul fichier ZIP depuis l'API ODK en Streaming et calcule la taille en direct"""
     dossier = f"traite/{date_str}/{url_info['form']}"
@@ -1753,7 +2759,7 @@ async def telecharger_un_fichier_hors_cloudflare(client: httpx.AsyncClient, url_
     except Exception as e:
         return {"statut": "erreur", "message": str(e), "info": url_info}
 
-async def telecharger_un_fichier(client: httpx.AsyncClient, url_info: dict, date_str: str, headers: dict, queue_progression: asyncio.Queue = None):
+async def telecharger_un_fichier_V1(client: httpx.AsyncClient, url_info: dict, date_str: str, headers: dict, queue_progression: asyncio.Queue = None):
     """Télécharge un fichier ZIP depuis ODK et le pousse directement en streaming vers Cloudflare R2"""
     
     # Définition du chemin permanent unique du fichier au sein de votre bucket R2
@@ -1841,8 +2847,126 @@ async def telecharger_un_fichier(client: httpx.AsyncClient, url_info: dict, date
           
     except Exception as e:
         return {"statut": "erreur", "message": str(e), "info": url_info}
-  
-async def telecharger_fichiers_hors_cloudflare(date_str: str, real_urls: list, connexion_bdd, connexion_bdd_master):
+
+async def telecharger_un_fichier(
+    client: httpx.AsyncClient, 
+    url_info: dict, 
+    date_str: str, 
+    headers: dict, 
+    queue_progression: asyncio.Queue = None,
+    stockage_local: bool = True
+):
+    """Télécharge un fichier ZIP depuis l'API ODK en Streaming (Local ou Cloudflare R2)"""
+    # 📁 Génération du chemin commun
+    chemin_base = f"traite/{date_str}/{url_info['form']}"
+    nom_fichier = f"{url_info['form']} {url_info['heure']}h.zip"
+    chemin_complet = f"{chemin_base}/{nom_fichier}"
+    
+    try: 
+        # 🔍 1. VÉRIFICATION DE L'EXISTENCE DU FICHIER
+        if stockage_local:
+            os.makedirs(chemin_base, exist_ok=True)
+            if os.path.exists(chemin_complet):
+                print("ok " + chemin_complet)
+                tester = extraire(date_str, url_info)
+                if "Test Dézippé OK" in tester:
+                    return {"statut": "ok", "chemin": chemin_complet, "info": url_info}
+        else:
+            try:
+                s3_client.head_object(Bucket=R2_BUCKET_NAME, Key=chemin_complet)
+                print(f"Le fichier existe déjà sur R2 : {chemin_complet}")
+                return {"statut": "ok", "chemin": chemin_complet, "info": url_info}
+            except Exception:
+                pass # Le fichier n'existe pas sur R2, on continue
+        
+        # 🚀 2. DÉBUT DU STREAMING DEPUIS ODK
+        async with client.stream("GET", url_info["url"], headers=headers, timeout=600.0) as reponse:
+            if reponse.status_code != 200:
+                return {"statut": "erreur", "message": f"Code HTTP {reponse.status_code}", "info": url_info}
+                
+            # 📊 Récupération de la taille totale
+            taille_totale = int(reponse.headers.get("Content-Length", 0))
+            taille_totale_mo = round(taille_totale / (1024 * 1024), 1) if taille_totale else 0
+            
+            octets_telecharges = 0
+            dernier_envoi = 0
+
+            # 🛠️ Initialisation des variables selon le mode de stockage
+            if stockage_local:
+                f_local = open(chemin_complet, "wb")
+            else:
+                mp_upload = s3_client.create_multipart_upload(Bucket=R2_BUCKET_NAME, Key=chemin_complet)
+                upload_id = mp_upload['UploadId']
+                parts = []
+                part_number = 1
+                tampon_memoire = b""
+                taille_minimale_morceau = 5 * 1024 * 1024 # 5 Mo
+
+            try:
+                async_chunks = reponse.aiter_bytes(chunk_size=16384)
+                async for chunk in async_chunks:
+                    octets_telecharges += len(chunk)
+                    
+                    # 💾 ÉCRITURE / TRAITEMENT DU CHUNK
+                    if stockage_local:
+                        f_local.write(chunk)
+                        f_local.flush()
+                    else:
+                        tampon_memoire += chunk
+                        if len(tampon_memoire) >= taille_minimale_morceau:
+                            partie_envoyee = s3_client.upload_part(
+                                Bucket=R2_BUCKET_NAME, Key=chemin_complet,
+                                PartNumber=part_number, UploadId=upload_id, Body=tampon_memoire
+                            )
+                            parts.append({"PartNumber": part_number, "ETag": partie_envoyee['ETag']})
+                            part_number += 1
+                            tampon_memoire = b""
+
+                    # 📈 CALCUL ET ENVOI DE LA PROGRESSION
+                    mo_actuels = round(octets_telecharges / (1024 * 1024), 1)
+                    if queue_progression and (mo_actuels - dernier_envoi >= 0.5 or mo_actuels == taille_totale_mo):
+                        dernier_envoi = mo_actuels
+                        texte_taille = f"{mo_actuels} Mo / {taille_totale_mo} Mo" if taille_totale_mo else f"{mo_actuels} Mo"
+                        await queue_progression.put(texte_taille)
+
+                    await asyncio.sleep(0)
+
+                # 🏁 FINALISATION DE L'ÉCRITURE
+                if stockage_local:
+                    f_local.close()
+                else:
+                    # Envoi du dernier morceau R2 si restant
+                    if tampon_memoire:
+                        partie_envoyee = s3_client.upload_part(
+                            Bucket=R2_BUCKET_NAME, Key=chemin_complet,
+                            PartNumber=part_number, UploadId=upload_id, Body=tampon_memoire
+                        )
+                        parts.append({"PartNumber": part_number, "ETag": partie_envoyee['ETag']})
+
+                    s3_client.complete_multipart_upload(
+                        Bucket=R2_BUCKET_NAME, Key=chemin_complet,
+                        UploadId=upload_id, MultipartUpload={'Parts': parts}
+                    )
+
+            except Exception as error_flux:
+                # 🧹 Nettoyage propre en cas de crash pendant le streaming
+                if stockage_local:
+                    f_local.close()
+                else:
+                    s3_client.abort_multipart_upload(Bucket=R2_BUCKET_NAME, Key=chemin_complet, UploadId=upload_id)
+                raise error_flux
+
+            return {"statut": "ok", "chemin": chemin_complet, "info": url_info}
+          
+    except Exception as e:
+        return {"statut": "erreur", "message": str(e), "info": url_info}
+
+
+
+
+
+
+async def telecharger_fichiers_hors_cloudflare(date_str: str, real_urls: list, download: str, connexion_bdd, connexion_bdd_master):
     """
     Télécharge et traite les fichiers en PARALLÈLE par lots de 5.
     Correction absolue de l'erreur TypeError pour Python 3.14+.
@@ -1945,7 +3069,7 @@ async def telecharger_fichiers_hors_cloudflare(date_str: str, real_urls: list, c
             
     await execution_globale
     
-async def telecharger_fichiers(date_str: str, real_urls: list, connexion_bdd, connexion_bdd_master):
+async def telecharger_fichiers_V1(date_str: str, real_urls: list, download: str, connexion_bdd, connexion_bdd_master):
     """
     Télécharge et traite les fichiers en PARALLÈLE par lots de 5 via Cloudflare R2.
     """
@@ -2020,6 +3144,237 @@ async def telecharger_fichiers(date_str: str, real_urls: list, connexion_bdd, co
             else:
                 await queue_messages.put({
                     'statut': f"❌ Erreur ODK/R2 : {resultat.get('message', 'Inconnu')} {url_info['form']} ({url_info['heure']}h)",
+                    'progression': progression_base
+                })
+            
+    async def executer_groupe_parallele():
+        async with httpx.AsyncClient(verify=False) as client:
+            taches = [
+                gerer_un_telechargement_et_traitement(i, url, client) 
+                for i, url in enumerate(real_urls)
+            ]
+            await asyncio.gather(*taches)
+    
+    execution_globale = asyncio.create_task(executer_groupe_parallele())
+    
+    while not execution_globale.done() or not queue_messages.empty():
+        try:
+            msg = await asyncio.wait_for(queue_messages.get(), timeout=0.1)
+            yield f"data: {json.dumps(msg)}\n\n"
+        except asyncio.TimeoutError:
+            pass
+            
+    await execution_globale
+
+async def telecharger_fichiers_save(date_str: str, real_urls: list, download: str, connexion_bdd, connexion_bdd_master):
+    """
+    Télécharge et traite les fichiers en PARALLÈLE par lots de 5.
+    Gère le mode local ou à distance (Cloudflare R2) via le paramètre 'download'.
+    Correction absolue de l'erreur TypeError pour Python 3.14+.
+    """
+    total = len(real_urls)
+    if total == 0:
+        # 1. Calcul de la date du jour précédent
+        date_initiale = datetime.strptime(date_str, "%Y-%m-%d")
+        date_prochaine_obj = date_initiale - timedelta(days=1)
+        dateprochaine = date_prochaine_obj.strftime("%Y-%m-%d")
+
+        print(f"🎉 Tous les fichiers du {date_str} ont été traités.")
+        print(f"🔄 Ordre de redirection envoyé vers la journée précédente : {dateprochaine}")
+            
+        # 2. On envoie un signal JSON spécifique que Vue.js va intercepter
+        yield f"data: {json.dumps({'action': 'redirection', 'prochaine_date': dateprochaine, 'statut': f'🎉 Tous les fichiers du {date_str} sont OK. Passage automatique au {dateprochaine}...'})}\n\n"
+        return
+        
+    # Adaptation du log serveur initial selon le mode
+    if download == "serveur":
+        print(f"🚀 Lancement du téléchargement vers Cloudflare R2 de {total} fichiers (Lots de 5)...")
+    else:
+        print(f"🚀 Lancement du téléchargement parallèle LOCAL de {total} fichiers (Lots de 5)...")
+    
+    token = "" #await obtenir_token_odk()    
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}" if token else ""
+    }
+    
+    semaphore = asyncio.Semaphore(5)
+    queue_messages = asyncio.Queue()
+
+    # --- SOUS-FONCTION DE SÉCURITÉ POUR CHAQUE FICHIER ---
+    async def gerer_un_telechargement_et_traitement(index, url_info, client):
+        async with semaphore:
+            progression_base = int((index / total) * 50) + 45
+            queue_taille = asyncio.Queue()
+            
+            # 1. Lancement du téléchargement asynchrone direct (R2 ou Local géré par la fonction interne)
+            if download == "serveur":
+                tache = asyncio.create_task(
+                    telecharger_un_fichier(client, url_info, date_str, headers, queue_taille, False)
+                )
+            else:
+                tache = asyncio.create_task(
+                    telecharger_un_fichier(client, url_info, date_str, headers, queue_taille, True)
+                )
+            
+            # Suivi visuel des Mo en direct transmis à Vue.js
+            while not tache.done() or not queue_taille.empty():
+                try:
+                    taille_texte = await asyncio.wait_for(queue_taille.get(), timeout=0.05)
+                    
+                    # Libellé dynamique du statut selon la destination
+                    prefixe_statut = "📥 Téléchargement Cloud R2" if download == "serveur" else "📥 Téléchargement"
+                    
+                    await queue_messages.put({
+                        'statut': f"{prefixe_statut} {url_info['form']} ({url_info['heure']}h) : {taille_texte}",
+                        'progression': progression_base
+                    })
+                except asyncio.TimeoutError:
+                    pass
+            
+            resultat = await tache
+            
+            # 2. Une fois le téléversement ou téléchargement réussi
+            if resultat["statut"] == "ok":
+                
+                # 🟢 Pause de sécurité uniquement en mode local pour laisser Windows libérer le fichier ZIP
+                if download == "local":
+                    await asyncio.sleep(0.1)
+                
+                # 🛠️ Note : Vos fonctions extraire() et traiter_fichier() doivent être capables
+                # d'adapter leur comportement si download == "serveur" (ex: via boto3 / chemins R2)
+                tester = extraire(date_str, url_info) 
+                
+                if "Test Dézippé OK" in tester:
+                    # Traitement BDD depuis l'archive locale ou stockée sur le Cloud
+                    result = await traiter_fichier(date_str, url_info, download)
+                    charger(result, date_str, url_info['heure'], url_info['form'], connexion_bdd, connexion_bdd_master)
+                    
+                    await queue_messages.put({
+                        'statut': f"✅ Insertion réussie : {url_info['form']} ({url_info['heure']}h)",
+                        'progression': progression_base
+                    })
+                else:
+                    suffixe_erreur = "archive R2" if download == "serveur" else "archive"
+                    await queue_messages.put({
+                        'statut': f"⚠️ Échec vérification {suffixe_erreur} : {url_info['form']} ({url_info['heure']}h)",
+                        'progression': progression_base
+                    })
+            else:
+                prefixe_erreur = "❌ Erreur ODK/R2 :" if download == "serveur" else "❌ Erreur ODK :"
+                await queue_messages.put({
+                    'statut': f"{prefixe_erreur} {resultat.get('message', 'Inconnu')} {url_info['form']} ({url_info['heure']}h)",
+                    'progression': progression_base
+                })
+            
+    # 🔥 CORRECTIF TYPING PYTHON 3.14 : Encapsulation dans une coroutine propre
+    async def executer_groupe_parallele():
+        async with httpx.AsyncClient(verify=False) as client:
+            taches = [
+                gerer_un_telechargement_et_traitement(i, url, client) 
+                for i, url in enumerate(real_urls)
+            ]
+            # gather est attendu directement avec 'await', sans create_task autour
+            await asyncio.gather(*taches)
+    
+    # Lancement de la coroutine globale
+    execution_globale = asyncio.create_task(executer_groupe_parallele())
+    
+    # Distribution continue des flux d'informations vers Vue.js
+    while not execution_globale.done() or not queue_messages.empty():
+        try:
+            msg = await asyncio.wait_for(queue_messages.get(), timeout=0.1)
+            yield f"data: {json.dumps(msg)}\n\n"
+        except asyncio.TimeoutError:
+            pass
+            
+    await execution_globale
+
+
+async def telecharger_fichiers(date_str: str, real_urls: list, download: str, connexion_bdd, connexion_bdd_master, is_pg):
+    """
+    Télécharge et traite les fichiers en PARALLÈLE par lots de 5.
+    Gère le mode local ou à distance (Cloudflare R2) via le paramètre 'download'.
+    Correction absolue de l'erreur TypeError pour Python 3.14+.
+    """
+    total = len(real_urls)
+    if total == 0:
+        date_initiale = datetime.strptime(date_str, "%Y-%m-%d")
+        date_prochaine_obj = date_initiale - timedelta(days=1)
+        dateprochaine = date_prochaine_obj.strftime("%Y-%m-%d")
+
+        print(f"🎉 Tous les fichiers du {date_str} ont été traités.")
+        yield f"data: {json.dumps({'action': 'redirection', 'prochaine_date': dateprochaine, 'statut': f'🎉 Tous les fichiers du {date_str} sont OK. Passage automatique au {dateprochaine}...'})}\n\n"
+        return
+        
+    if download == "serveur":
+        print(f"🚀 Lancement du téléchargement vers Cloudflare R2 de {total} fichiers (Lots de 5)...")
+    else:
+        print(f"🚀 Lancement du téléchargement parallèle LOCAL de {total} fichiers (Lots de 5)...")
+    
+    token = "" #await obtenir_token_odk()  
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}" if token else ""
+    }
+    
+    semaphore = asyncio.Semaphore(5)
+    queue_messages = asyncio.Queue()
+    
+    # 🟢 VERROU CRITIQUE : Empêche l'envoi de requêtes simultanées sur la même connexion SSL master
+    verrou_bdd_master = asyncio.Lock()
+
+    async def gerer_un_telechargement_et_traitement(index, url_info, client):
+        async with semaphore:
+            progression_base = int((index / total) * 50) + 45
+            queue_taille = asyncio.Queue()
+            
+            tache = asyncio.create_task(
+                telecharger_un_fichier(client, url_info, date_str, headers, queue_taille)
+            )
+            
+            while not tache.done() or not queue_taille.empty():
+                try:
+                    taille_texte = await asyncio.wait_for(queue_taille.get(), timeout=0.05)
+                    prefixe_statut = "📥 Téléchargement Cloud R2" if download == "serveur" else "📥 Téléchargement"
+                    await queue_messages.put({
+                        'statut': f"{prefixe_statut} {url_info['form']} ({url_info['heure']}h) : {taille_texte}",
+                        'progression': progression_base
+                    })
+                except asyncio.TimeoutError:
+                    pass
+            
+            resultat = await tache
+            
+            if resultat["statut"] == "ok":
+                if download == "local":
+                    await asyncio.sleep(0.1)
+                
+                tester = extraire(date_str, url_info) 
+                
+                if "Test Dézippé OK" in tester:
+                    result = await traiter_fichier(date_str, url_info, download, is_pg)
+                    
+                    # 🟢 SÉCURISATION : Un seul fichier à la fois accède à charger()
+                    async with verrou_bdd_master:
+                        charger(result, date_str, url_info['heure'], url_info['form'], connexion_bdd, connexion_bdd_master, is_pg)
+                    
+                    await queue_messages.put({
+                        'statut': f"✅ Insertion réussie : {url_info['form']} ({url_info['heure']}h)",
+                        'progression': progression_base
+                    })
+                else:
+                    suffixe_erreur = "archive R2" if download == "serveur" else "archive"
+                    await queue_messages.put({
+                        'statut': f"⚠️ Échec vérification {suffixe_erreur} : {url_info['form']} ({url_info['heure']}h)",
+                        'progression': progression_base
+                    })
+            else:
+                prefixe_erreur = "❌ Erreur ODK/R2 :" if download == "serveur" else "❌ Erreur ODK :"
+                await queue_messages.put({
+                    'statut': f"{prefixe_erreur} {resultat.get('message', 'Inconnu')} {url_info['form']} ({url_info['heure']}h)",
                     'progression': progression_base
                 })
             
