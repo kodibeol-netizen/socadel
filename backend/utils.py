@@ -1135,6 +1135,18 @@ def charger(result: list, date: str, heure: str, form: str, connection, connecti
                     INNER JOIN chargement_odk AS l ON t.cle = l.cle 
                     WHERE CHAR_LENGTH(t.bloc) > 0;
                 """
+            
+                """
+                -- Mettre à jour 'point' vers SRID 4326
+                UPDATE `chargement_odk` 
+                SET `point` = ST_SRID(`point`, 4326) 
+                WHERE `point` IS NOT NULL;
+
+                -- Mettre à jour 'mra_point' vers SRID 4326
+                UPDATE `chargement_odk` 
+                SET `mra_point` = ST_SRID(`mra_point`, 4326) 
+                WHERE `mra_point` IS NOT NULL;
+                """
             # 1. Écriture du log en local
             if is_connection_open(connection):
                 try:
