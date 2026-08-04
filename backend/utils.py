@@ -531,7 +531,7 @@ def charger_save(result: list, date: str, heure: str, form: str, connection, con
                 COUNT(CASE WHEN LENGTH(mra_contrat) <= 6 AND action = 'RECOUVREMENT' THEN 1 END) AS CUMUL_NON_IDENTIFIE_RECOUVREMENT,
 
                 COUNT(CASE WHEN LENGTH(mra_contrat) > 6 AND ST_Distance_Sphere(mra_point, point) < 500 AND action = 'RELEVE' THEN 1 END) AS CUMUL_MOIN_500_RELEVE,
-                COUNT(CASE WHEN LENGTH(mra_contrat) > 6 AND ST_Distance_Sphere(mra_point, point) >= 500 AND action = 'DEPANRELEVENAGE' THEN 1 END) AS CUMUL_PLUS_500_RELEVE,
+                COUNT(CASE WHEN LENGTH(mra_contrat) > 6 AND ST_Distance_Sphere(mra_point, point) >= 500 AND action = 'RELEVE' THEN 1 END) AS CUMUL_PLUS_500_RELEVE,
                 COUNT(CASE WHEN LENGTH(mra_contrat) <= 6 AND action = 'RELEVE' THEN 1 END) AS CUMUL_NON_IDENTIFIE_RELEVE,
 
                 COUNT(CASE WHEN LENGTH(mra_contrat) > 6 AND ST_Distance_Sphere(mra_point, point) < 500 AND action = 'BRANCHEMENT' THEN 1 END) AS CUMUL_MOIN_500_BRANCHEMENT,
@@ -1096,7 +1096,6 @@ def charger(result: list, date: str, heure: str, form: str, connection, connecti
                             WHERE (t.ref_formulaire = 'DRC' OR t.ref_formulaire = 'DCUY') 
                             AND (t.mra_contrat IS NULL OR t.mra_contrat = '') 
                             ORDER BY t.cle ASC 
-                            LIMIT 10000
                         ) AS sub_drc
                     ) AS sub ON target.cle = sub.cle
                     SET target.mra_contrat = COALESCE(sub.mra_contrat, 'non identifie'), 

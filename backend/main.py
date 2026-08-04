@@ -14,7 +14,7 @@ import sys
 import secrets
 from pathlib import Path
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -27,6 +27,9 @@ try:
     from .utils import uuid, obtenir_token_odk, lien, telecharger_fichiers
 except ImportError:
     from utils import uuid, obtenir_token_odk, lien, telecharger_fichiers
+
+import boto3
+from io import BytesIO
 
 # =========================================================================
 # 1. INITIALISATION ET CONFIGURATION DES VARIABLES GLOBALES
@@ -43,6 +46,33 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+)
+
+
+# Récupération des accès sécurisés enregistrés sur Render
+R2_ACCOUNT_ID = "b2fc9f08cec582dfaa7b307451c4fbe0" #os.getenv("R2_ACCOUNT_ID")
+R2_ACCESS_KEY_ID = "d4c718c573c963c8e376f45d50507633" #os.getenv("R2_ACCESS_KEY_ID")
+R2_SECRET_ACCESS_KEY = "998eafe1d321f29a12f2fc2f265060faf65326bf97946da2c2616f8147fcd494" #os.getenv("R2_SECRET_ACCESS_KEY")
+
+
+# Configuration boto3
+s3_client = boto3.client(
+    's3',
+    aws_access_key_id=R2_ACCESS_KEY_ID,
+    aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+    endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"  # Ou l'URL de votre serveur S3/MinIO
+)
+BUCKET_NAME = "socadel-storage"
+URL_SECOURS_BASE = "https://migration.odk.elementfx.com/photos_odk/"  # Adresse de fallback (sans le slash de fin)
+#https://migration.odk.elementfx.com/photos_odk/DCUY/media/1781186889783.jpg
+#https://migration.odk.elementfx.com/photos_odk/DCUY/media/1781186889783.jpg
+
+# Initialisation du client S3 compatible Cloudflare R2
+s3_client = boto3.client(
+    service_name="s3",
+    endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
+    aws_access_key_id=R2_ACCESS_KEY_ID,
+    aws_secret_access_key=R2_SECRET_ACCESS_KEY
 )
 
 # 3. Définition des variables globales à partir du fichier externe .env
@@ -1058,6 +1088,62 @@ def obtenir_contours_blocs_multiples(codes_blocs: list[str] = Body(...)):
     finally:
         if connection:
             connection.close()
+
+
+@app.get("/api/photos/{region}/{nom_fichier}")
+def proxy_photo(region: str, nom_fichier: str):
+    # Clé S3 correspondant à l'arborescence : "region/nom_fichier"
+    cle_s3 = f"photos/{region}/media/{nom_fichier}"
+    print(f"photos/{region}/media/{nom_fichier}")
+    # ----------------------------------------------------
+    # TENTATIVE 1 : Récupération depuis S3 via Boto3
+    # ----------------------------------------------------
+    try:
+        s3_object = s3_client.get_object(Bucket=BUCKET_NAME, Key=cle_s3)
+        content_type = s3_object.get('ContentType', 'image/jpeg')
+        
+        # Retourne le flux S3 direct
+        return StreamingResponse(
+            s3_object['Body'].iter_chunks(chunk_size=1024 * 8), 
+            media_type=content_type
+        )
+        
+    except s3_client.exceptions.NoSuchKey:
+        print(f"⚠️ [S3] Image '{cle_s3}' introuvable sur S3, tentative sur l'URL de secours...")
+    except Exception as e:
+        print(f"⚠️ [S3 Error] Impossible de joindre S3 pour '{cle_s3}' : {e}, bascule sur l'URL de secours...")
+
+    # ----------------------------------------------------
+    # TENTATIVE 2 : Fallback vers l'URL externe avec sous-dossier region
+    # ----------------------------------------------------
+    
+    url_secours = f"{URL_SECOURS_BASE}{region}/media/{nom_fichier}"
+    
+    try:
+        # Requête vers l'adresse distante
+        response = requests.get(url_secours, stream=True, timeout=5)
+        
+        # Si la photo existe sur le serveur externe (Code HTTP 200 OK)
+        if response.status_code == 200:
+            content_type = response.headers.get('Content-Type', 'image/jpeg')
+            return StreamingResponse(
+                response.iter_content(chunk_size=1024 * 8), 
+                media_type=content_type
+            )
+        
+        print(f"❌ [Fallback] Image introuvable sur {url_secours} (Code HTTP: {response.status_code})")
+
+    except requests.RequestException as e:
+        print(f"❌ [Fallback Error] Erreur lors de la requête vers {url_secours} : {e}")
+
+    # ----------------------------------------------------
+    # SI AUCUNE DES DEUX SOURCES N'A TROUVÉ L'IMAGE
+    # ----------------------------------------------------
+    raise HTTPException(
+        status_code=404, 
+        detail=f"L'image '{cle_s3}' n'existe ni sur S3 ni sur le serveur de secours."
+    )
+
 # =========================================================================
 # 6. SÉCURITÉ UNIVERSELLE ANTI-404 POUR LES SPA ROUTER (Toutes vos pages)
 # =========================================================================
