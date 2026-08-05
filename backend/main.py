@@ -1064,7 +1064,7 @@ def obtenir_contours_blocs_multiples(codes_blocs: list[str] = Body(...)):
                 FROM `contours_blocs` 
                 WHERE `code_bloc` IN ({format_strings})
             """
-            sql = f"SELECT `block_code`, `ZONE_CODE`, `LOCALITE`, ST_AsGeoJSON(boundary) AS boundary FROM `bloc` WHERE `block_code` IN ({format_strings})"
+            sql = f"SELECT `block_code`, `ZONE_CODE`, `LOCALITE`, `REGION`, `AGENCE`, ST_AsGeoJSON(boundary) AS boundary FROM `bloc` WHERE `block_code` IN ({format_strings})"
             cursor.execute(sql, tuple(codes_blocs))
             results = cursor.fetchall()
             features = []
@@ -1073,7 +1073,7 @@ def obtenir_contours_blocs_multiples(codes_blocs: list[str] = Body(...)):
                 if row.get('boundary'):
                     features.append({
                         "type": "Feature",
-                        "properties": {"code_bloc": row["block_code"]},
+                        "properties": {"code_bloc": row["block_code"], "localite": row["LOCALITE"], "zone_code": row["ZONE_CODE"], "region": row["REGION"], "agence": row["AGENCE"]},
                         "geometry": json.loads(row["boundary"])
                     })
             print(sql)
